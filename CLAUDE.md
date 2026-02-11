@@ -100,6 +100,8 @@ The frontend can connect to the model via three backends (configured by environm
 - RunPod requires `--platform linux/amd64` when building Docker on Mac
 - Model uses bfloat16 on GPU, float32 on CPU
 - Generation stops at `</statements>` tag to prevent runaway output
+- **v0.9.6**: Database v3 schema — `db_info` metadata table with `schema_version=3`. Lite databases drop ALL embedding tables (float32 + scalar int8) — uses USearch index files for search. `db upload` now includes USearch `.bin` files. `db download` fetches USearch indexes alongside database. Filenames: `entities-v3.db` / `entities-v3-lite.db`. Global `--db-version` CLI flag for backwards compatibility (`corp-extractor --db-version=2 db download`). Symlink `entities-v2.db` → v3 file on download for backwards compat.
+- **v0.9.5**: USearch HNSW indexes for sub-millisecond search on 50M+ vectors. 3-thread parallel Wikidata dump import (reader/embedder/writer). Multi-record person import (one person per position+org). Auto-canonicalization after dump import with recency tiebreaker. New CLI: `db post-import`, `db build-index`, `db rebuild-vec`. `--hybrid` flag for text+embeddings search. `fast-import` extras (orjson, indexed_bzip2). Zstandard (.zst) dump support. New `hf_classifier` labeler plugin.
 - **v0.9.4**: Database v2 schema with normalized FK references (replaces TEXT enums with INTEGER FKs). New tables: `roles`, `locations`, `location_types`. Scalar (int8) embeddings for 75% storage reduction (~92% recall). New CLI: `db migrate-v2`, `db backfill-scalar`, `db search-roles`, `db search-locations`. Locations import via `--locations` flag.
 - **v0.9.3**: Added SEC Form 4 officers import (`import-sec-officers`) and Companies House officers import (`import-ch-officers`). People now sourced from wikidata, sec_edgar, and companies_house. People canonicalization with priority wikidata > sec_edgar > companies_house.
 - **v0.9.1**: Added Wikidata dump importer (`import-wikidata-dump`) for large imports without SPARQL timeouts. Uses aria2c for fast parallel downloads. Extracts people via occupation (P106) and position dates (P580/P582).
@@ -124,9 +126,9 @@ The library provides a 5-stage extraction pipeline:
 - **Splitters**: `t5_gemma_splitter`
 - **Extractors**: `gliner2_extractor`
 - **Qualifiers**: `person_qualifier` (Wikidata person database lookup), `embedding_company_qualifier` (organization database lookup)
-- **Labelers**: `sentiment_labeler`, `confidence_labeler`, `relation_type_labeler`
+- **Labelers**: `sentiment_labeler`, `confidence_labeler`, `relation_type_labeler`, `hf_classifier` (custom HuggingFace models, not auto-registered)
 - **Taxonomy**: `embedding_taxonomy_classifier` (default), `mnli_taxonomy_classifier`
-- **PDF**: `pypdf_loader` - PDF parsing with PyMuPDF
+- **PDF**: `pypdf_parser` (default) - PDF text extraction with PyMuPDF + Tesseract OCR fallback; `glm_ocr_parser` - GLM-OCR 0.9B VLM for high-quality OCR (scans, tables, formulas)
 - **Scrapers**: `http_scraper` - URL/web page scraping
 
 ### Entity Database
@@ -226,8 +228,10 @@ corp-extractor plugins list              # List plugins
 
 # Document processing (v0.7.0)
 corp-extractor document process article.txt
+corp-extractor document process report.pdf                                       # Local PDF (auto-detected)
+corp-extractor document process report.pdf --pdf-parser glm_ocr_parser           # Use GLM-OCR VLM parser
 corp-extractor document process https://example.com/article
-corp-extractor document process report.pdf --use-ocr
+corp-extractor document process https://example.com/report.pdf --use-ocr
 
 # Entity database
 corp-extractor db import-sec --download  # Bulk SEC data (73K filers)
@@ -243,15 +247,21 @@ corp-extractor db import-wikidata-dump --dump dump.bz2 --skip-updates  # Skip ex
 corp-extractor db import-wikidata-dump --download --require-enwiki  # Only orgs with English Wikipedia
 corp-extractor db import-wikidata-dump --dump dump.bz2 --locations --no-people --no-orgs  # Locations only (v0.9.4)
 corp-extractor db canonicalize           # Link equivalent records across sources
+corp-extractor db post-import            # Run after any import: embeddings + USearch index + VACUUM
+corp-extractor db post-import --no-orgs  # People only
+corp-extractor db build-index            # Build USearch HNSW index for fast ANN search
+corp-extractor db rebuild-vec            # Rebuild vec0 tables with distance_metric=cosine
 corp-extractor db status                 # Show database statistics
 corp-extractor db status --for-llm       # Output schema and enum tables for LLM docs
-corp-extractor db search "Microsoft"     # Search organizations
+corp-extractor db search "Microsoft"     # Search organizations (USearch HNSW)
+corp-extractor db search "Microsoft" --hybrid  # Hybrid text + embeddings search
 corp-extractor db search-people "Tim Cook"  # Search people (v0.9.0)
 corp-extractor db search-roles "CEO"     # Search roles (v0.9.4)
 corp-extractor db search-locations "California"  # Search locations (v0.9.4)
-corp-extractor db upload                 # Upload with lite/compressed variants
-corp-extractor db download               # Download lite version (default)
-corp-extractor db download --full        # Download full version
+corp-extractor db upload                 # Upload with lite variant + USearch indexes
+corp-extractor db download               # Download lite version + USearch indexes (default)
+corp-extractor db download --full        # Download full version + USearch indexes
+corp-extractor --db-version=2 db download  # Download v2 database files
 corp-extractor db migrate-v2 entities.db entities-v2.db  # Migrate to v2 schema (v0.9.4)
 corp-extractor db backfill-scalar        # Generate int8 embeddings (v0.9.4)
 ```

@@ -610,10 +610,12 @@ Documents are split into chunks based on token count with configurable overlap:
 
 #### URL and PDF Support
 
-The document pipeline can fetch and process content from URLs:
+The document pipeline can fetch and process content from URLs and local PDF files:
 
 - **Web pages**: HTML content is extracted using Readability-style parsing
-- **PDFs**: Parsed using PyMuPDF with optional OCR for scanned documents
+- **PDFs**: Two built-in parsers available via `--pdf-parser` flag:
+  - `pypdf_parser` (default) — PyMuPDF text extraction with Tesseract OCR fallback
+  - `glm_ocr_parser` — GLM-OCR 0.9B VLM for high-quality OCR of scans, tables, and formulas
 
 ```python
 from statement_extractor.document import DocumentPipeline
@@ -627,6 +629,18 @@ ctx = await pipeline.process_url("https://example.com/article")
 from statement_extractor.document import URLLoaderConfig
 config = URLLoaderConfig(use_ocr=True)
 ctx = await pipeline.process_url("https://example.com/report.pdf", config)
+
+# Process a PDF with GLM-OCR parser
+config = URLLoaderConfig(pdf_parser_plugin="glm_ocr_parser")
+ctx = await pipeline.process_url("https://example.com/report.pdf", config)
+```
+
+```bash
+# CLI: local PDF with default parser
+corp-extractor document process report.pdf
+
+# CLI: local PDF with GLM-OCR VLM parser
+corp-extractor document process report.pdf --pdf-parser glm_ocr_parser
 ```
 
 #### Cross-Chunk Deduplication
@@ -639,7 +653,7 @@ When processing long documents, the same fact may appear in multiple chunks. The
 
 <a id="entity-database"></a>
 
-<span className="text-xs font-medium bg-green-100 dark:bg-green-900 text-green-800 dark:text-green-200 px-2 py-0.5 rounded">UPDATED in v0.9.0</span>
+<span className="text-xs font-medium bg-green-100 dark:bg-green-900 text-green-800 dark:text-green-200 px-2 py-0.5 rounded">UPDATED in v0.9.6</span>
 
 The entity embedding database provides fast qualification for both **organizations** and **people** using vector similarity search.
 
@@ -682,7 +696,7 @@ The entity embedding database provides fast qualification for both **organizatio
   </tbody>
 </table>
 
-**Total: 9.6M+ organization records**
+**Total: 9.7M+ organization records**
 
 #### Person Data Sources <span className="text-xs font-medium bg-green-100 dark:bg-green-900 text-green-800 dark:text-green-200 px-2 py-0.5 rounded">UPDATED in v0.9.3</span>
 
@@ -704,14 +718,14 @@ The entity embedding database provides fast qualification for both **organizatio
     </tr>
     <tr>
       <td>Wikidata</td>
-      <td>13.4M</td>
+      <td>36M</td>
       <td>QID</td>
       <td>Notable people with English Wikipedia articles</td>
     </tr>
   </tbody>
 </table>
 
-**Total: 41M+ people records**
+**Total: 63M+ people records**
 
 #### Person Types
 
@@ -863,7 +877,7 @@ Each organization record is classified with an `entity_type` field to distinguis
 #### How It Works
 
 1. **Embedding Generation**: Organization names are embedded using EmbeddingGemma (300M params)
-2. **Vector Search**: sqlite-vec enables fast similarity search across millions of records
+2. **Vector Search**: USearch HNSW indexes enable sub-millisecond approximate nearest neighbor search across 50M+ records
 3. **Qualification**: When an ORG entity is found, the database is searched for matching organizations
 4. **Identifier Resolution**: Matched organizations provide LEI, CIK, company numbers, etc.
 
@@ -880,7 +894,7 @@ Each organization record is classified with an `entity_type` field to distinguis
   <tbody>
     <tr>
       <td>Roles</td>
-      <td>94K+</td>
+      <td>139K+</td>
       <td>Job titles with Wikidata QIDs (CEO, Director, etc.)</td>
     </tr>
     <tr>
@@ -893,6 +907,7 @@ Each organization record is classified with an `entity_type` field to distinguis
 
 #### Database Variants
 
-- **entities-lite.db** (30.1 GB): Core fields and int8 embeddings only (default download)
-- **entities.db** (32.2 GB): Full database with complete source metadata
-- **\*.db.gz**: Gzip compressed versions for faster downloads
+- **entities-v3-lite.db**: Core fields only, no embedding tables (default download)
+- **entities-v3.db**: Full database with all embedding tables and source metadata
+- **organizations_usearch.bin**: USearch HNSW index for organization search
+- **people_usearch.bin**: USearch HNSW index for person search

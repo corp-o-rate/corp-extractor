@@ -1,6 +1,6 @@
 # Corp Extractor
 
-Analyze complex text to extract relationship information about people and organizations. Runs entirely on your hardware (RTX 4090+, Apple M1 16GB+) with no external API dependencies. Uses fine-tuned T5-Gemma 2 for statement splitting and coreference resolution, plus GLiNER2 for entity extraction. Includes a database of 10M+ organizations and 40M+ people with quantized embeddings for fast entity qualification.
+Analyze complex text to extract relationship information about people and organizations. Runs entirely on your hardware (RTX 4090+, Apple M1 16GB+) with no external API dependencies. Uses fine-tuned T5-Gemma 2 for statement splitting and coreference resolution, plus GLiNER2 for entity extraction. Includes a database of 9.7M+ organizations and 63M+ people with USearch HNSW indexes for fast entity qualification.
 
 [![PyPI version](https://img.shields.io/pypi/v/corp-extractor.svg)](https://pypi.org/project/corp-extractor/)
 [![Python 3.10+](https://img.shields.io/pypi/pyversions/corp-extractor.svg)](https://pypi.org/project/corp-extractor/)
@@ -8,12 +8,15 @@ Analyze complex text to extract relationship information about people and organi
 
 ## Features
 
+- **Database v3** *(v0.9.6)*: Lite databases drop all embedding tables — USearch indexes distributed with `db download`/`db upload`. Global `--db-version` flag for version control.
+- **USearch HNSW Indexes** *(v0.9.5)*: Sub-millisecond approximate nearest neighbor search on 50M+ vectors with pre-built HNSW indexes
+- **Parallel Import** *(v0.9.5)*: 3-thread pipeline (reader/embedder/writer) for fast Wikidata dump import with optional orjson and indexed_bzip2
 - **Database v2 Schema** *(v0.9.4)*: Normalized schema with INTEGER FK references, new roles/locations tables, int8 scalar embeddings (75% smaller)
 - **Person Database** *(v0.9.2)*: Qualify notable people (executives, politicians, athletes, etc.) against Wikidata with canonical IDs
 - **Organization Canonicalization** *(v0.9.2)*: Link equivalent records across sources (LEI, ticker, CIK, name matching)
 - **5-Stage Pipeline** *(v0.8.0)*: Modular plugin-based architecture for full entity resolution
 - **Document Processing** *(v0.7.0)*: Process documents, URLs, and PDFs with chunking and deduplication
-- **Entity Embedding Database** *(v0.6.0)*: Fast entity qualification using vector similarity (9.6M organizations, 41M people)
+- **Entity Embedding Database** *(v0.6.0)*: Fast entity qualification using vector similarity (9.7M organizations, 63M people)
 - **Structured Extraction**: Converts unstructured text into subject-predicate-object triples
 - **Entity Type Recognition**: Identifies 12 entity types (ORG, PERSON, GPE, LOC, PRODUCT, EVENT, etc.)
 - **Entity Qualification** *(v0.8.0)*: Adds identifiers (LEI, ticker, company numbers), canonical names, and FQN via embedding database
@@ -43,6 +46,11 @@ pip install corp-extractor
 **For Apple Silicon (M1/M2/M3)**, MPS acceleration is automatically detected:
 ```bash
 pip install corp-extractor  # MPS used automatically
+```
+
+**For fast Wikidata dump import** (optional, ~3x JSON parsing + 6x decompression):
+```bash
+pip install "corp-extractor[fast-import]"  # Adds orjson + indexed_bzip2
 ```
 
 ## Quick Start
@@ -330,13 +338,20 @@ config = PipelineConfig.from_stage_string("1-3")  # Stages 1, 2, 3
 
 Taxonomy classifiers return **multiple labels** per statement above the confidence threshold.
 
+**PDF Parsers:**
+- `pypdf_parser` (priority 100, default) - PyMuPDF text extraction with Tesseract OCR fallback
+- `glm_ocr_parser` (priority 200) - GLM-OCR 0.9B VLM for high-quality OCR of scans, tables, and formulas
+
+**Scrapers:**
+- `http_scraper` - URL/web page scraping with httpx
+
 ## Entity Database
 
 The library includes an **entity embedding database** for fast entity qualification using vector similarity search. It stores records from authoritative sources (GLEIF, SEC, Companies House, Wikidata) with 768-dimensional embeddings for semantic matching.
 
 **Quick start:**
 ```bash
-corp-extractor db download              # Download pre-built database
+corp-extractor db download              # Download pre-built database + USearch indexes
 corp-extractor db search "Microsoft"    # Search organizations
 corp-extractor db search-people "Tim Cook"  # Search people
 corp-extractor db search-roles "CEO"    # Search roles (v0.9.4)
@@ -344,6 +359,35 @@ corp-extractor db search-locations "California"  # Search locations (v0.9.4)
 ```
 
 For comprehensive documentation including schema, CLI reference, Python API, and build instructions, see **[ENTITY_DATABASE.md](./ENTITY_DATABASE.md)**.
+
+## New in v0.9.5: USearch HNSW Indexes & Parallel Import
+
+v0.9.5 introduces **USearch HNSW indexes** for sub-millisecond approximate nearest neighbor search and a **3-thread parallel import pipeline** for fast Wikidata dump imports.
+
+- **USearch HNSW indexes**: Pre-built indexes for both people and organizations enable sub-millisecond search on 50M+ vectors
+- **3-thread parallel import**: Reader, embedder, and writer threads work concurrently during Wikidata dump import
+- **Multi-record person import**: One person now yields multiple records (one per position+org combination, max 10)
+- **Auto-canonicalization**: Runs automatically after dump import with recency tiebreaker (most recent from_date preferred)
+- **`--hybrid` search flag**: Combine text filtering with USearch embeddings search for higher precision
+- **Fast import extras**: Optional `orjson` (~3x JSON parsing) and `indexed_bzip2` (6x decompression)
+- **Zstandard support**: Import from `.zst`/`.zstd` compressed dumps
+- **`db post-import`**: New command to run after any import (generates embeddings, builds USearch indexes, runs VACUUM)
+- **`db build-index`**: Build or rebuild USearch HNSW indexes
+- **`hf_classifier` labeler**: New general-purpose HuggingFace sequence classification labeler plugin
+
+```bash
+# After any import, run post-import to build indexes
+corp-extractor db post-import
+
+# Or build just the USearch index
+corp-extractor db build-index
+
+# Search with hybrid mode
+corp-extractor db search "Microsoft" --hybrid
+
+# Install fast-import extras
+pip install "corp-extractor[fast-import]"
+```
 
 ## New in v0.9.4: Database v2 Schema
 
@@ -365,7 +409,7 @@ corp-extractor db migrate-v2 entities.db entities-v2.db
 corp-extractor db backfill-scalar
 ```
 
-**Default database path**: `~/.cache/corp-extractor/entities-v2.db`
+**Default database path**: `~/.cache/corp-extractor/entities-v3.db`
 
 ## New in v0.6.0: Entity Embedding Database
 
@@ -387,7 +431,7 @@ v0.6.0 introduces an **entity embedding database** for fast entity qualification
 | Source | Records | Identifier | PersonType Classification |
 |--------|---------|------------|--------------------------|
 | Companies House | 27.5M | Person number | UK company officers |
-| Wikidata | 13.4M | Wikidata QID | executive, politician, athlete, artist, academic, scientist, journalist, entrepreneur, activist |
+| Wikidata | 36M | Wikidata QID | executive, politician, athlete, artist, academic, scientist, journalist, entrepreneur, activist |
 | Wikidata (Dump) | All humans with enwiki | Wikidata QID | Classified from positions (P39) and occupations (P106) |
 
 **Date Fields**: All importers now include `from_date` and `to_date` where available:
@@ -434,6 +478,13 @@ corp-extractor db import-wikidata-dump --dump dump.bz2 --locations --no-people -
 corp-extractor db migrate-v2 entities.db entities-v2.db
 corp-extractor db backfill-scalar        # Generate int8 embeddings (75% smaller)
 
+# Post-import: generate embeddings, build USearch indexes, VACUUM (v0.9.5)
+corp-extractor db post-import
+corp-extractor db post-import --no-orgs  # People only
+
+# Build USearch HNSW index for fast ANN search (v0.9.5)
+corp-extractor db build-index
+
 # Check status
 corp-extractor db status
 
@@ -461,20 +512,19 @@ for stmt in ctx.labeled_statements:
 ### Publishing to HuggingFace
 
 ```bash
-# Upload database with all variants (full, lite, compressed)
+# Upload database with all variants (full, lite, USearch indexes)
 export HF_TOKEN="hf_..."
 corp-extractor db upload                     # Uses default cache location
-corp-extractor db upload entities.db         # Or specify path
+corp-extractor db upload entities-v3.db      # Or specify path
 corp-extractor db upload --no-lite           # Skip lite version
-corp-extractor db upload --no-compress       # Skip compressed versions
 
-# Download pre-built database (lite version by default)
-corp-extractor db download                   # Lite version (smaller, faster)
-corp-extractor db download --full            # Full version with all metadata
+# Download pre-built database + USearch indexes (lite version by default)
+corp-extractor db download                   # Lite version + USearch indexes
+corp-extractor db download --full            # Full version + USearch indexes
+corp-extractor --db-version=2 db download    # Download v2 files
 
 # Local database management
-corp-extractor db create-lite entities.db    # Create lite version
-corp-extractor db compress entities.db       # Compress with gzip
+corp-extractor db create-lite entities-v3.db # Create lite version (drops embeddings)
 ```
 
 See [ENTITY_DATABASE.md](./ENTITY_DATABASE.md) for complete build and publish instructions.
@@ -489,6 +539,10 @@ v0.7.0 introduces **document-level processing** for handling files, URLs, and PD
 # Process local files
 corp-extractor document process article.txt
 corp-extractor document process report.txt --title "Annual Report" --year 2024
+
+# Process local PDFs (auto-detected by .pdf extension)
+corp-extractor document process report.pdf
+corp-extractor document process report.pdf --pdf-parser glm_ocr_parser
 
 # Process URLs (web pages and PDFs)
 corp-extractor document process https://example.com/article
@@ -536,15 +590,28 @@ for stmt in ctx.labeled_statements:
 
 ### PDF Processing
 
-PDFs are automatically parsed using PyMuPDF. For scanned PDFs, use OCR:
+PDFs are automatically parsed using PyMuPDF (default `pypdf_parser`). For scanned documents, image-heavy PDFs, tables, and formulas, use the GLM-OCR VLM parser:
 
 ```bash
-# Install OCR dependencies
-pip install "corp-extractor[ocr]"
+# Process a local PDF (uses default pypdf_parser)
+corp-extractor document process report.pdf
 
-# Process with OCR
+# Use GLM-OCR 0.9B VLM for high-quality OCR
+corp-extractor document process scanned.pdf --pdf-parser glm_ocr_parser
+
+# Force Tesseract OCR with the default parser
 corp-extractor document process scanned.pdf --use-ocr
+
+# Process PDF from URL
+corp-extractor document process https://example.com/report.pdf --pdf-parser glm_ocr_parser
 ```
+
+**Available PDF parsers** (listed via `corp-extractor plugins list`):
+
+| Parser | Priority | Description |
+|--------|----------|-------------|
+| `pypdf_parser` | 100 (default) | PyMuPDF text extraction with Tesseract OCR fallback |
+| `glm_ocr_parser` | 200 | GLM-OCR 0.9B VLM — renders pages to images, outputs markdown. Best for scans, tables, formulas. |
 
 ## New in v0.4.0: GLiNER2 Integration
 
@@ -715,7 +782,7 @@ The library uses a **5-stage pipeline** architecture:
 
 1. **Stage 1 - Splitting (T5-Gemma2)**: Splits text into atomic sentences using Diverse Beam Search ([Vijayakumar et al., 2016](https://arxiv.org/abs/1610.02424)) with coreference resolution
 2. **Stage 2 - Extraction (GLiNER2)**: Extracts subject-predicate-object relations using 324 predicates across 21 categories. Returns ALL relations above confidence threshold (0.75)
-3. **Stage 3 - Qualification**: Looks up entities against 10M+ organizations and 40M+ people in the embedding database, adding canonical IDs and FQNs
+3. **Stage 3 - Qualification**: Looks up entities against 9.7M+ organizations and 63M+ people in the embedding database, adding canonical IDs and FQNs
 4. **Stage 4 - Labeling**: Adds sentiment, confidence, and relation type labels (classifications pre-computed in Stage 2)
 5. **Stage 5 - Taxonomy**: Classifies statements against taxonomies (e.g., ESG topics) using embedding similarity
 

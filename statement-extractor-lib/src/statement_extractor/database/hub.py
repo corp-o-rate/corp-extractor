@@ -18,14 +18,35 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+# Database schema version — bump this when the schema changes
+DB_VERSION = 3
+
 # Default HuggingFace repo for entity database
 DEFAULT_REPO_ID = "Corp-o-Rate-Community/entity-references"
-DEFAULT_DB_FILENAME = "entities-v2-lite.db"  # Lite is the default (smaller download)
-DEFAULT_DB_FULL_FILENAME = "entities-v2.db"
-DEFAULT_DB_LITE_FILENAME = "entities-v2-lite.db"
+DEFAULT_DB_FILENAME = f"entities-v{DB_VERSION}-lite.db"  # Lite is the default (smaller download)
+DEFAULT_DB_FULL_FILENAME = f"entities-v{DB_VERSION}.db"
+DEFAULT_DB_LITE_FILENAME = f"entities-v{DB_VERSION}-lite.db"
+
+# USearch index filenames (co-located with database)
+USEARCH_INDEX_FILES = ["organizations_usearch.bin", "people_usearch.bin"]
 
 # Local cache directory
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "corp-extractor"
+
+
+def db_filenames(version: int | None = None) -> tuple[str, str, str]:
+    """Return (full_filename, lite_filename, default_filename) for a given DB version.
+
+    Args:
+        version: Schema version number. None uses DB_VERSION (latest).
+
+    Returns:
+        Tuple of (full, lite, default) filenames.
+    """
+    v = version or DB_VERSION
+    full = f"entities-v{v}.db"
+    lite = f"entities-v{v}-lite.db"
+    return full, lite, lite  # default is lite
 
 
 def get_database_path(
@@ -52,11 +73,13 @@ def get_database_path(
     # Check if database exists in cache
     cache_dir = DEFAULT_CACHE_DIR
 
-    # Check common locations
+    # Check common locations (v3 first, then v2 fallback)
     possible_paths = [
         cache_dir / filename,
-        cache_dir / "entities-v2.db",
-        cache_dir / "entities.db",  # Legacy fallback
+        cache_dir / "entities-v3.db",
+        cache_dir / "entities-v3-lite.db",
+        cache_dir / "entities-v2.db",  # v2 fallback (or symlink target)
+        cache_dir / "entities.db",  # Legacy v1 fallback
         Path.home() / ".cache" / "huggingface" / "hub" / f"datasets--{repo_id.replace('/', '--')}" / filename,
     ]
 
@@ -218,12 +241,12 @@ def create_lite_database(
     output_path: Optional[str | Path] = None,
 ) -> Path:
     """
-    Create a lite version of the database without full records.
+    Create a lite version of the database for runtime use.
 
     The lite version:
     - Strips the `record` column content (sets to empty {})
-    - Drops float32 embedding tables (keeps only scalar int8 embeddings)
-    - Significantly reduces file size (~75% reduction)
+    - Drops ALL embedding tables (float32 + scalar int8) — uses USearch indexes for search
+    - Significantly reduces file size
 
     Args:
         source_db_path: Path to the full database
@@ -272,29 +295,15 @@ def create_lite_database(
 
         conn.execute("COMMIT")
 
-        # Drop float32 embedding tables (keep only scalar int8 for 75% storage savings)
-        # Check if scalar tables exist before dropping float32 tables
-        cursor = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='organization_embeddings_scalar'"
-        )
-        has_org_scalar = cursor.fetchone() is not None
-
-        cursor = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='person_embeddings_scalar'"
-        )
-        has_person_scalar = cursor.fetchone() is not None
-
-        if has_org_scalar:
-            logger.info("Dropping float32 organization_embeddings table (keeping scalar)")
-            conn.execute("DROP TABLE IF EXISTS organization_embeddings")
-        else:
-            logger.warning("No scalar organization embeddings found, keeping float32 table")
-
-        if has_person_scalar:
-            logger.info("Dropping float32 person_embeddings table (keeping scalar)")
-            conn.execute("DROP TABLE IF EXISTS person_embeddings")
-        else:
-            logger.warning("No scalar person embeddings found, keeping float32 table")
+        # Drop ALL embedding tables — lite databases use USearch indexes for search
+        for table in [
+            "organization_embeddings",
+            "organization_embeddings_scalar",
+            "person_embeddings",
+            "person_embeddings_scalar",
+        ]:
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
+            logger.info(f"Dropped {table}")
 
         # Vacuum to reclaim space (must be outside transaction)
         conn.execute("VACUUM")
@@ -320,13 +329,14 @@ def upload_database_with_variants(
     token: Optional[str] = None,
     include_lite: bool = True,
     include_readme: bool = True,
+    version: Optional[int] = None,
 ) -> dict[str, str]:
     """
-    Upload entity database with optional lite variant.
+    Upload entity database with optional lite variant and USearch indexes.
 
     First VACUUMs the database, then creates and uploads:
-    - entities-v2.db (full database with v2 normalized schema)
-    - entities-v2-lite.db (without record data, smaller)
+    - Full database + lite variant (without record data or embeddings)
+    - organizations_usearch.bin, people_usearch.bin (HNSW indexes)
     - README.md (dataset card from ENTITY_DATABASE.md)
 
     Args:
@@ -336,6 +346,7 @@ def upload_database_with_variants(
         token: HuggingFace API token
         include_lite: Whether to create and upload lite version
         include_readme: Whether to upload the README.md dataset card
+        version: Database version for filenames (default: DB_VERSION)
 
     Returns:
         Dict mapping filename to upload URL
@@ -347,6 +358,8 @@ def upload_database_with_variants(
             "huggingface_hub is required for database upload. "
             "Install with: pip install huggingface_hub"
         )
+
+    full_fn, lite_fn, _ = db_filenames(version)
 
     db_path = Path(db_path)
     if not db_path.exists():
@@ -380,13 +393,13 @@ def upload_database_with_variants(
         files_to_upload = []
 
         # Full database
-        files_to_upload.append((db_path, DEFAULT_DB_FULL_FILENAME))
+        files_to_upload.append((db_path, full_fn))
 
         # Lite version
         if include_lite:
-            lite_path = temp_path / DEFAULT_DB_LITE_FILENAME
+            lite_path = temp_path / lite_fn
             create_lite_database(db_path, lite_path)
-            files_to_upload.append((lite_path, DEFAULT_DB_LITE_FILENAME))
+            files_to_upload.append((lite_path, lite_fn))
 
         # Copy all files to a staging directory for upload_folder
         staging_dir = temp_path / "staging"
@@ -395,6 +408,18 @@ def upload_database_with_variants(
         for local_path, remote_filename in files_to_upload:
             shutil.copy2(local_path, staging_dir / remote_filename)
             logger.info(f"Staged {remote_filename}")
+
+        # Stage USearch index files from the same directory as the source database
+        db_dir = db_path.parent
+        for idx_name in USEARCH_INDEX_FILES:
+            idx_path = db_dir / idx_name
+            if idx_path.exists():
+                shutil.copy2(idx_path, staging_dir / idx_name)
+                files_to_upload.append((idx_path, idx_name))
+                idx_size_mb = idx_path.stat().st_size / 1024**2
+                logger.info(f"Staged {idx_name} ({idx_size_mb:.0f} MB)")
+            else:
+                logger.warning(f"USearch index not found: {idx_path} — skipping")
 
         # Add README.md from ENTITY_DATABASE.md
         if include_readme:
@@ -432,7 +457,11 @@ def download_database(
     force_download: bool = False,
 ) -> Path:
     """
-    Download entity database from HuggingFace Hub.
+    Download entity database and USearch indexes from HuggingFace Hub.
+
+    Downloads the database file plus any available USearch HNSW index files
+    (organizations_usearch.bin, people_usearch.bin). Missing indexes are
+    logged as warnings — they can be rebuilt with `db build-index`.
 
     Args:
         repo_id: HuggingFace repo ID (e.g., "Corp-o-Rate-Community/entity-references")
@@ -467,4 +496,21 @@ def download_database(
     )
 
     logger.info(f"Database downloaded to {local_path}")
+
+    # Also download USearch index files
+    for idx_name in USEARCH_INDEX_FILES:
+        try:
+            idx_path = hf_hub_download(
+                repo_id=repo_id,
+                filename=idx_name,
+                revision=revision,
+                cache_dir=str(cache_dir),
+                force_download=force_download,
+                repo_type="dataset",
+            )
+            idx_size_mb = Path(idx_path).stat().st_size / 1024**2
+            logger.info(f"Downloaded {idx_name} ({idx_size_mb:.0f} MB)")
+        except Exception as e:
+            logger.warning(f"USearch index {idx_name} not available: {e} — rebuild with: corp-extractor db build-index")
+
     return Path(local_path)

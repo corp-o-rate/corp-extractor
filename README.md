@@ -2,14 +2,15 @@
 
 A Python library and web demo for extracting relationship information about people and organizations from complex text. Runs entirely on your hardware (RTX 4090+, Apple M1 16GB+) with no external API dependencies.
 
-Uses fine-tuned [T5-Gemma 2](https://blog.google/technology/developers/t5gemma-2/) for statement splitting and coreference resolution (trained on 70,000+ pages), plus [GLiNER2](https://github.com/urchade/GLiNER) for entity extraction. Includes a database of 10M+ organizations and 40M+ people with quantized embeddings for fast entity qualification (~100GB disk for all models and data).
+Uses fine-tuned [T5-Gemma 2](https://blog.google/technology/developers/t5gemma-2/) for statement splitting and coreference resolution (trained on 70,000+ pages), plus [GLiNER2](https://github.com/urchade/GLiNER) for entity extraction. Includes a database of 9.7M+ organizations and 63M+ people with USearch HNSW indexes for fast entity qualification (~100GB disk for all models and data).
 
 ## Features
 
 - **Statement Extraction**: Transform unstructured text into structured subject-predicate-object triples
 - **5-Stage Pipeline** *(v0.8.0)*: Plugin-based architecture with entity qualification, labeling, and taxonomy classification
-- **Entity Database** *(v0.9.4)*: 10M+ organizations and 40M+ people with int8 quantized embeddings (75% smaller)
-- **Database v2 Schema** *(v0.9.4)*: Normalized schema with roles, locations, and efficient INTEGER foreign keys
+- **Database v3 Schema** *(v0.9.6)*: Lite databases drop all embedding tables — USearch indexes for search. Global `--db-version` flag for backwards compatibility.
+- **USearch HNSW Indexes** *(v0.9.5)*: Sub-millisecond search on 50M+ vectors with pre-built HNSW indexes
+- **Entity Database** *(v0.9.6)*: 9.7M+ organizations and 63M+ people with USearch HNSW indexes for fast entity qualification
 - **EntityType Classification** *(v0.8.0)*: Classify organizations as business, nonprofit, government, educational, etc.
 - **Entity Recognition**: Automatic identification of entity types (ORG, PERSON, GPE, EVENT, etc.)
 - **Relationship Graph**: Interactive D3.js visualization of entity relationships
@@ -70,6 +71,10 @@ corp-extractor split "Apple Inc. announced a new iPhone."
 corp-extractor pipeline "Apple CEO Tim Cook announced..."
 corp-extractor pipeline -f article.txt --stages 1-3
 
+# Process local PDFs and documents
+corp-extractor document process report.pdf
+corp-extractor document process report.pdf --pdf-parser glm_ocr_parser
+
 # List available plugins
 corp-extractor plugins list
 ```
@@ -113,6 +118,9 @@ corp-extractor db import-people --all --limit 10000  # SPARQL-based
 corp-extractor db import-wikidata-dump --download --limit 50000  # Uses ~100GB dump
 corp-extractor db import-wikidata-dump --dump dump.json.bz2 --resume  # Resume interrupted import
 
+# Post-import: generate embeddings, build USearch indexes, VACUUM
+corp-extractor db post-import
+
 # Canonicalize organizations (v0.9.2) - link equivalent records
 corp-extractor db canonicalize
 
@@ -122,9 +130,12 @@ corp-extractor db search-people "Tim Cook"
 
 # Download pre-built database from HuggingFace
 corp-extractor db download
+
+# Download older v2 database files
+corp-extractor --db-version=2 db download
 ```
 
-See [ENTITY_DATABASE.md](statement-extractor-lib/ENTITY_DATABASE.md) for complete build and publish instructions.
+See [ENTITY_DATABASE.md](ENTITY_DATABASE.md) for complete build and publish instructions.
 
 ### Direct Model Access
 

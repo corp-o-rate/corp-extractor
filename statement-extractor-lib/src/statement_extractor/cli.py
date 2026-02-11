@@ -12,7 +12,9 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import Optional
+import queue
+import threading
+from typing import NamedTuple, Optional
 
 import click
 
@@ -47,6 +49,7 @@ def _configure_logging(verbose: bool) -> None:
         "statement_extractor.plugins.scrapers.http",
         "statement_extractor.plugins.pdf",
         "statement_extractor.plugins.pdf.pypdf",
+        "statement_extractor.plugins.pdf.glm_ocr",
         "statement_extractor.document",
         "statement_extractor.document.loader",
         "statement_extractor.document.html_extractor",
@@ -77,9 +80,39 @@ from .models import (
 )
 
 
+def _resolve_db_path(db_path: Optional[str] = None) -> Path:
+    """Resolve the database path from an explicit --db value or --db-version context.
+
+    Checks v3 first, then falls back to v2 if the v3 file doesn't exist.
+    """
+    if db_path is not None:
+        return Path(db_path)
+    # Check for --db-version in the Click context chain
+    try:
+        ctx = click.get_current_context(silent=True)
+        db_version = ctx.obj.get("db_version") if ctx and ctx.obj else None
+    except RuntimeError:
+        db_version = None
+    if db_version is not None:
+        from .database.hub import DEFAULT_CACHE_DIR, db_filenames
+        full_fn, _, _ = db_filenames(db_version)
+        return DEFAULT_CACHE_DIR / full_fn
+    # Default: try v3, fall back to v2
+    from .database.hub import DEFAULT_CACHE_DIR
+    from .database.store import DEFAULT_DB_PATH
+    if DEFAULT_DB_PATH.exists():
+        return DEFAULT_DB_PATH
+    v2_path = DEFAULT_CACHE_DIR / "entities-v2.db"
+    if v2_path.exists():
+        return v2_path
+    return DEFAULT_DB_PATH  # Return v3 path even if missing (for creation)
+
+
 @click.group()
 @click.version_option(version=__version__)
-def main():
+@click.option("--db-version", type=int, default=None, hidden=True, help="Database schema version for filenames (default: latest)")
+@click.pass_context
+def main(ctx: click.Context, db_version: int | None):
     """
     Extract structured statements from text.
 
@@ -99,7 +132,8 @@ def main():
         corp-extractor document process report.txt --title "Annual Report"
         corp-extractor plugins list
     """
-    pass
+    ctx.ensure_object(dict)
+    ctx.obj["db_version"] = db_version
 
 
 # =============================================================================
@@ -655,7 +689,8 @@ def _load_all_plugins():
 # =============================================================================
 
 @main.group("db")
-def db_cmd():
+@click.pass_context
+def db_cmd(ctx: click.Context):
     """
     Manage entity/organization embedding database.
 
@@ -689,7 +724,7 @@ def db_cmd():
         corp-extractor db search-people "Tim Cook"
         corp-extractor db upload entities.db
     """
-    pass
+    ctx.ensure_object(dict)
 
 
 @db_cmd.command("gleif-info")
@@ -772,8 +807,9 @@ def db_import_gleif(file_path: Optional[str], download: bool, force: bool, db_pa
     click.echo(f"Importing GLEIF data from {file_path}...", err=True)
 
     # Initialize components (readonly=False for import operations)
+    db_path_obj = _resolve_db_path(db_path)
     embedder = CompanyEmbedder()
-    database = OrganizationDatabase(db_path=db_path, embedding_dim=embedder.embedding_dim, readonly=False)
+    database = OrganizationDatabase(db_path=db_path_obj, embedding_dim=embedder.embedding_dim, readonly=False)
 
     # Import records in batches
     records = []
@@ -799,6 +835,7 @@ def db_import_gleif(file_path: Optional[str], download: bool, force: bool, db_pa
         count += len(records)
 
     click.echo(f"\nImported {count} GLEIF records successfully.", err=True)
+    click.echo("Run `corp-extractor db post-import` to update search indexes.", err=True)
     database.close()
 
 
@@ -832,8 +869,9 @@ def db_import_sec(download: bool, file_path: Optional[str], db_path: Optional[st
         raise click.UsageError("Either --download or --file is required")
 
     # Initialize components (readonly=False for import operations)
+    db_path_obj = _resolve_db_path(db_path)
     embedder = CompanyEmbedder()
-    database = OrganizationDatabase(db_path=db_path, embedding_dim=embedder.embedding_dim, readonly=False)
+    database = OrganizationDatabase(db_path=db_path_obj, embedding_dim=embedder.embedding_dim, readonly=False)
     importer = SecEdgarImporter()
 
     # Get records
@@ -867,6 +905,7 @@ def db_import_sec(download: bool, file_path: Optional[str], db_path: Optional[st
         count += len(records)
 
     click.echo(f"\nImported {count} SEC Edgar records successfully.", err=True)
+    click.echo("Run `corp-extractor db post-import` to update search indexes.", err=True)
     database.close()
 
 
@@ -900,15 +939,12 @@ def db_import_sec_officers(db_path: Optional[str], start_year: int, end_year: Op
     """
     _configure_logging(verbose)
 
-    from .database.store import get_person_database, get_database, DEFAULT_DB_PATH
+    from .database.store import get_person_database, get_database
     from .database.embeddings import CompanyEmbedder
     from .database.importers.sec_form4 import SecForm4Importer
 
     # Default database path
-    if db_path is None:
-        db_path_obj = DEFAULT_DB_PATH
-    else:
-        db_path_obj = Path(db_path)
+    db_path_obj = _resolve_db_path(db_path)
 
     click.echo(f"Importing SEC Form 4 officers/directors to {db_path_obj}...", err=True)
     click.echo(f"Year range: {start_year} - {end_year or 'current'}", err=True)
@@ -972,6 +1008,7 @@ def db_import_sec_officers(db_path: Optional[str], start_year: int, end_year: Op
         click.echo(f"\nImported {count} SEC officers/directors (skipped {skipped_existing} existing).", err=True)
     else:
         click.echo(f"\nImported {count} SEC officers/directors successfully.", err=True)
+    click.echo("Run `corp-extractor db post-import` to update search indexes.", err=True)
 
     org_database.close()
     database.close()
@@ -1001,15 +1038,12 @@ def db_import_ch_officers(file_path: str, db_path: Optional[str], limit: Optiona
     """
     _configure_logging(verbose)
 
-    from .database.store import get_person_database, get_database, DEFAULT_DB_PATH
+    from .database.store import get_person_database, get_database
     from .database.embeddings import CompanyEmbedder
     from .database.importers.companies_house_officers import CompaniesHouseOfficersImporter
 
     # Default database path
-    if db_path is None:
-        db_path_obj = DEFAULT_DB_PATH
-    else:
-        db_path_obj = Path(db_path)
+    db_path_obj = _resolve_db_path(db_path)
 
     click.echo(f"Importing Companies House officers to {db_path_obj}...", err=True)
     if resume:
@@ -1072,6 +1106,7 @@ def db_import_ch_officers(file_path: str, db_path: Optional[str], limit: Optiona
         click.echo(f"\nImported {count} CH officers (skipped {skipped_existing} existing).", err=True)
     else:
         click.echo(f"\nImported {count} CH officers successfully.", err=True)
+    click.echo("Run `corp-extractor db post-import` to update search indexes.", err=True)
 
     org_database.close()
     database.close()
@@ -1117,8 +1152,9 @@ def db_import_wikidata(db_path: Optional[str], limit: Optional[int], batch_size:
     click.echo(f"Importing Wikidata organization data via SPARQL (type={query_type}, all={import_all})...", err=True)
 
     # Initialize components (readonly=False for import operations)
+    db_path_obj = _resolve_db_path(db_path)
     embedder = CompanyEmbedder()
-    database = OrganizationDatabase(db_path=db_path, embedding_dim=embedder.embedding_dim, readonly=False)
+    database = OrganizationDatabase(db_path=db_path_obj, embedding_dim=embedder.embedding_dim, readonly=False)
     importer = WikidataImporter(batch_size=500)  # Smaller SPARQL batch size for reliability
 
     # Import records in batches
@@ -1144,6 +1180,7 @@ def db_import_wikidata(db_path: Optional[str], limit: Optional[int], batch_size:
         count += len(records)
 
     click.echo(f"\nImported {count} Wikidata records successfully.", err=True)
+    click.echo("Run `corp-extractor db post-import` to update search indexes.", err=True)
     database.close()
 
 
@@ -1181,15 +1218,12 @@ def db_import_people(db_path: Optional[str], limit: Optional[int], batch_size: i
     """
     _configure_logging(verbose)
 
-    from .database.store import get_person_database, get_database, DEFAULT_DB_PATH
+    from .database.store import get_person_database, get_database
     from .database.embeddings import CompanyEmbedder
     from .database.importers.wikidata_people import WikidataPeopleImporter
 
     # Default database path
-    if db_path is None:
-        db_path_obj = DEFAULT_DB_PATH
-    else:
-        db_path_obj = Path(db_path)
+    db_path_obj = _resolve_db_path(db_path)
 
     click.echo(f"Importing Wikidata people to {db_path_obj}...", err=True)
 
@@ -1321,8 +1355,154 @@ def db_import_people(db_path: Optional[str], limit: Optional[int], batch_size: i
 
             click.echo(f"Updated {updated} people with dates.", err=True)
 
+    click.echo("Run `corp-extractor db post-import` to update search indexes.", err=True)
     org_database.close()
     database.close()
+
+
+class ImportBatch(NamedTuple):
+    """A batch of records ready for embedding, produced by the reader thread."""
+    record_type: str          # "people" or "org"
+    records: list             # PersonRecord or CompanyRecord list
+    embedding_texts: list[str]
+    last_entity_index: int
+    last_entity_id: str
+    people_count: int         # cumulative people yielded so far
+    orgs_count: int           # cumulative orgs yielded so far
+
+
+def _reader_thread(
+    importer,
+    *,
+    people: bool,
+    orgs: bool,
+    limit: Optional[int],
+    require_enwiki: bool,
+    skip_updates: bool,
+    existing_people_ids: set[str],
+    existing_org_ids: set[str],
+    start_index: int,
+    batch_size: int,
+    embed_queue: queue.Queue,
+    shutdown_event: threading.Event,
+    thread_errors: list[Exception],
+) -> None:
+    """Reader thread: iterates the dump, accumulates batches, puts them on embed_queue."""
+    import logging
+    logger = logging.getLogger(__name__)
+
+    people_records: list = []
+    org_records: list = []
+    last_entity_index = start_index
+    last_entity_id = ""
+    people_yielded = 0
+    orgs_yielded = 0
+
+    def progress_callback(entity_index: int, entity_id: str, ppl_count: int, org_count: int) -> None:
+        nonlocal last_entity_index, last_entity_id
+        last_entity_index = entity_index
+        last_entity_id = entity_id
+
+    def flush_people() -> None:
+        nonlocal people_records, people_yielded
+        if people_records and not shutdown_event.is_set():
+            texts = [r.get_embedding_text() for r in people_records]
+            people_yielded += len(people_records)
+            batch = ImportBatch(
+                record_type="people",
+                records=list(people_records),
+                embedding_texts=texts,
+                last_entity_index=last_entity_index,
+                last_entity_id=last_entity_id,
+                people_count=people_yielded,
+                orgs_count=orgs_yielded,
+            )
+            embed_queue.put(batch)
+            people_records = []
+
+    def flush_orgs() -> None:
+        nonlocal org_records, orgs_yielded
+        if org_records and not shutdown_event.is_set():
+            texts = [r.name for r in org_records]
+            orgs_yielded += len(org_records)
+            batch = ImportBatch(
+                record_type="org",
+                records=list(org_records),
+                embedding_texts=texts,
+                last_entity_index=last_entity_index,
+                last_entity_id=last_entity_id,
+                people_count=people_yielded,
+                orgs_count=orgs_yielded,
+            )
+            embed_queue.put(batch)
+            org_records = []
+
+    try:
+        for record_type, record in importer.import_all(
+            people_limit=limit if people else 0,
+            orgs_limit=limit if orgs else 0,
+            import_people=people,
+            import_orgs=orgs,
+            require_enwiki=require_enwiki,
+            skip_people_ids=existing_people_ids if skip_updates else None,
+            skip_org_ids=existing_org_ids if skip_updates else None,
+            start_index=start_index,
+            progress_callback=progress_callback,
+        ):
+            if shutdown_event.is_set():
+                logger.info("Reader thread: shutdown requested, stopping")
+                break
+
+            if record_type == "person":
+                people_records.append(record)
+                if len(people_records) >= batch_size:
+                    flush_people()
+            else:  # org
+                org_records.append(record)
+                if len(org_records) >= batch_size:
+                    flush_orgs()
+
+        # Flush remaining partial batches
+        flush_people()
+        flush_orgs()
+
+    except Exception as e:
+        thread_errors.append(e)
+    finally:
+        # Sentinel: reader is done
+        embed_queue.put(None)
+
+
+def _embedder_thread(
+    embedder,
+    *,
+    embed_queue: queue.Queue,
+    result_queue: queue.Queue,
+    shutdown_event: threading.Event,
+    thread_errors: list[Exception],
+) -> None:
+    """Embedder thread: consumes ImportBatch, produces (batch, embeddings, scalar_embeddings)."""
+    import logging
+    logger = logging.getLogger(__name__)
+
+    try:
+        while True:
+            batch = embed_queue.get()
+            if batch is None:
+                # Reader is done
+                break
+            if shutdown_event.is_set():
+                logger.info("Embedder thread: shutdown requested, stopping")
+                break
+
+            embeddings, scalar_embeddings = embedder.embed_batch_and_quantize(batch.embedding_texts)
+            result_queue.put((batch, embeddings, scalar_embeddings))
+
+    except Exception as e:
+        thread_errors.append(e)
+    finally:
+        # Sentinel: embedder is done
+        result_queue.put(None)
 
 
 @db_cmd.command("import-wikidata-dump")
@@ -1392,7 +1572,7 @@ def db_import_wikidata_dump(
     """
     _configure_logging(verbose)
 
-    from .database.store import get_person_database, get_database, get_locations_database, DEFAULT_DB_PATH
+    from .database.store import get_person_database, get_database, get_locations_database
     from .database.embeddings import CompanyEmbedder
     from .database.importers.wikidata_dump import WikidataDumpImporter, DumpProgress
 
@@ -1403,10 +1583,7 @@ def db_import_wikidata_dump(
         raise click.UsageError("Must import at least one of --people, --orgs, or --locations")
 
     # Default database path
-    if db_path is None:
-        db_path_obj = DEFAULT_DB_PATH
-    else:
-        db_path_obj = Path(db_path)
+    db_path_obj = _resolve_db_path(db_path)
 
     click.echo(f"Importing Wikidata dump to {db_path_obj}...", err=True)
 
@@ -1679,18 +1856,16 @@ def db_import_wikidata_dump(
     person_database = get_person_database(db_path=db_path_obj, readonly=False)
     org_database = get_database(db_path=db_path_obj, readonly=False) if orgs else None
 
-    # Batches for each type
-    people_records: list = []
-    org_records: list = []
+    # Pipeline: reader thread → embed_queue → embedder thread → result_queue → main thread (DB writes)
+    embed_queue: queue.Queue = queue.Queue(maxsize=2)
+    result_queue: queue.Queue = queue.Queue(maxsize=2)
+    shutdown_event = threading.Event()
+    thread_errors: list[Exception] = []
+
     people_count = 0
     orgs_count = 0
     last_entity_index = start_index
     last_entity_id = ""
-
-    def combined_progress_callback(entity_index: int, entity_id: str, ppl_count: int, org_count: int) -> None:
-        nonlocal last_entity_index, last_entity_id
-        last_entity_index = entity_index
-        last_entity_id = entity_id
 
     def save_progress() -> None:
         if progress:
@@ -1700,119 +1875,135 @@ def db_import_wikidata_dump(
             progress.orgs_yielded = orgs_count
             progress.save()
 
-    def flush_people_batch() -> None:
-        nonlocal people_records, people_count
-        if people_records:
-            embedding_texts = [r.get_embedding_text() for r in people_records]
-            embeddings, scalar_embeddings = embedder.embed_batch_and_quantize(embedding_texts)
-            person_database.insert_batch(people_records, embeddings, scalar_embeddings=scalar_embeddings)
-            people_count += len(people_records)
-            people_records = []
-
-    def flush_org_batch() -> None:
-        nonlocal org_records, orgs_count
-        if org_records and org_database:
-            names = [r.name for r in org_records]
-            embeddings, scalar_embeddings = embedder.embed_batch_and_quantize(names)
-            org_database.insert_batch(org_records, embeddings, scalar_embeddings=scalar_embeddings)
-            orgs_count += len(org_records)
-            org_records = []
-
-    # Calculate total for progress bar (if limits set for both)
-    total_limit = None
-    if limit and people and orgs:
-        total_limit = limit * 2  # Rough estimate
-    elif limit:
-        total_limit = limit
-
-    click.echo("Starting dump iteration...", err=True)
+    click.echo("Starting parallel pipeline (reader → embedder → writer)...", err=True)
     sys.stderr.flush()
 
-    records_seen = 0
+    reader = threading.Thread(
+        target=_reader_thread,
+        args=(importer,),
+        kwargs=dict(
+            people=people,
+            orgs=orgs,
+            limit=limit,
+            require_enwiki=require_enwiki,
+            skip_updates=skip_updates,
+            existing_people_ids=existing_people_ids,
+            existing_org_ids=existing_org_ids,
+            start_index=start_index,
+            batch_size=batch_size,
+            embed_queue=embed_queue,
+            shutdown_event=shutdown_event,
+            thread_errors=thread_errors,
+        ),
+        daemon=True,
+        name="wikidata-reader",
+    )
+    embedder_thread = threading.Thread(
+        target=_embedder_thread,
+        args=(embedder,),
+        kwargs=dict(
+            embed_queue=embed_queue,
+            result_queue=result_queue,
+            shutdown_event=shutdown_event,
+            thread_errors=thread_errors,
+        ),
+        daemon=True,
+        name="wikidata-embedder",
+    )
+
+    reader.start()
+    embedder_thread.start()
+
     try:
-        if total_limit:
-            # Use progress bar when we have limits
-            with click.progressbar(
-                length=total_limit,
-                label="Processing dump",
-                show_percent=True,
-                show_pos=True,
-            ) as pbar:
-                for record_type, record in importer.import_all(
-                    people_limit=limit if people else 0,
-                    orgs_limit=limit if orgs else 0,
-                    import_people=people,
-                    import_orgs=orgs,
-                    require_enwiki=require_enwiki,
-                    skip_people_ids=existing_people_ids if skip_updates else None,
-                    skip_org_ids=existing_org_ids if skip_updates else None,
-                    start_index=start_index,
-                    progress_callback=combined_progress_callback,
-                ):
-                    records_seen += 1
-                    pbar.update(1)
+        while True:
+            # Check for thread errors before blocking
+            if thread_errors:
+                raise thread_errors[0]
 
-                    if record_type == "person":
-                        people_records.append(record)
-                        if len(people_records) >= batch_size:
-                            flush_people_batch()
-                            persist_new_labels()
-                            save_progress()
-                    else:  # org
-                        org_records.append(record)
-                        if len(org_records) >= batch_size:
-                            flush_org_batch()
-                            persist_new_labels()
-                            save_progress()
-        else:
-            # No limit - show counter updates
-            for record_type, record in importer.import_all(
-                people_limit=None,
-                orgs_limit=None,
-                import_people=people,
-                import_orgs=orgs,
-                require_enwiki=require_enwiki,
-                skip_people_ids=existing_people_ids if skip_updates else None,
-                skip_org_ids=existing_org_ids if skip_updates else None,
-                start_index=start_index,
-                progress_callback=combined_progress_callback,
-            ):
-                records_seen += 1
-                # Show first record immediately as proof of life
-                if records_seen == 1:
-                    click.echo(f"  First record found: {record.name}", err=True)
-                    sys.stderr.flush()
+            result = result_queue.get()
+            if result is None:
+                # Embedder is done — all batches processed
+                break
 
-                if record_type == "person":
-                    people_records.append(record)
-                    if len(people_records) >= batch_size:
-                        flush_people_batch()
-                        persist_new_labels()
-                        save_progress()
-                        click.echo(f"\r  Progress: {people_count:,} people, {orgs_count:,} orgs...", nl=False, err=True)
-                        sys.stderr.flush()
-                else:  # org
-                    org_records.append(record)
-                    if len(org_records) >= batch_size:
-                        flush_org_batch()
-                        persist_new_labels()
-                        save_progress()
-                        click.echo(f"\r  Progress: {people_count:,} people, {orgs_count:,} orgs...", nl=False, err=True)
-                        sys.stderr.flush()
+            batch, embeddings, scalar_embeddings = result
 
-            click.echo("", err=True)  # Newline after counter
+            # Insert into database (main thread owns SQLite writes)
+            if batch.record_type == "people":
+                person_database.insert_batch(batch.records, embeddings, scalar_embeddings=scalar_embeddings)
+            elif batch.record_type == "org" and org_database:
+                org_database.insert_batch(batch.records, embeddings, scalar_embeddings=scalar_embeddings)
 
-        # Final batches
-        flush_people_batch()
-        flush_org_batch()
+            # Update progress from batch metadata
+            people_count = batch.people_count
+            orgs_count = batch.orgs_count
+            last_entity_index = batch.last_entity_index
+            last_entity_id = batch.last_entity_id
+
+            persist_new_labels()
+            save_progress()
+
+            click.echo(f"\r  Progress: {people_count:,} people, {orgs_count:,} orgs...", nl=False, err=True)
+            sys.stderr.flush()
+
+        click.echo("", err=True)  # Newline after counter
+
+        # Check for any errors that occurred after the sentinel
+        if thread_errors:
+            raise thread_errors[0]
+
+    except KeyboardInterrupt:
+        click.echo("\n  Interrupted! Saving progress...", err=True)
+        shutdown_event.set()
+        # Drain any completed batches from result_queue so we don't lose work
+        while True:
+            try:
+                result = result_queue.get_nowait()
+                if result is None:
+                    break
+                batch, embeddings, scalar_embeddings = result
+                if batch.record_type == "people":
+                    person_database.insert_batch(batch.records, embeddings, scalar_embeddings=scalar_embeddings)
+                elif batch.record_type == "org" and org_database:
+                    org_database.insert_batch(batch.records, embeddings, scalar_embeddings=scalar_embeddings)
+                people_count = batch.people_count
+                orgs_count = batch.orgs_count
+                last_entity_index = batch.last_entity_index
+                last_entity_id = batch.last_entity_id
+            except queue.Empty:
+                break
         persist_new_labels()
         save_progress()
-
+        click.echo(f"  Saved: {people_count:,} people, {orgs_count:,} orgs", err=True)
+        raise
     finally:
-        # Ensure we save progress even on interrupt
         save_progress()
+        reader.join(timeout=5)
+        embedder_thread.join(timeout=5)
 
     click.echo(f"Import complete: {people_count:,} people, {orgs_count:,} orgs", err=True)
+
+    # Backfill known_for_org from reverse org→person mappings
+    # (P169 CEO, P488 chairperson, P112 founder, P1037 director, P3320 board member)
+    reverse_map = importer.get_reverse_person_orgs()
+    if reverse_map and people:
+        # Resolve org QIDs to labels before backfilling
+        label_cache = importer.get_label_cache()
+        resolved_map: dict[str, list[tuple[str, str, str | None, str | None]]] = {}
+        for person_qid, entries in reverse_map.items():
+            resolved_entries: list[tuple[str, str, str | None, str | None]] = []
+            for org_qid, role, start_date, end_date in entries:
+                org_label = label_cache.get(org_qid, "")
+                if org_label:
+                    resolved_entries.append((org_label, role, start_date, end_date))
+            if resolved_entries:
+                resolved_map[person_qid] = resolved_entries
+        if resolved_map:
+            backfilled = person_database.backfill_known_for_org(resolved_map)
+            click.echo(
+                f"Backfilled known_for_org from org executive properties: "
+                f"{backfilled:,} updated ({len(resolved_map):,} reverse mappings)",
+                err=True,
+            )
 
     # Keep references for final label resolution
     database = person_database
@@ -1865,17 +2056,39 @@ def db_import_wikidata_dump(
     # Final stats
     final_label_count = database.get_qid_labels_count()
     click.echo(f"  Total labels in DB: {final_label_count:,}", err=True)
+
+    # Run canonicalization to link equivalent records across sources
+    click.echo("\n=== Canonicalization ===", err=True)
+    if people:
+        people_result = person_database.canonicalize()
+        click.echo(
+            f"  People: {people_result['canonical_groups']:,} groups, "
+            f"{people_result['matched_by_org']:,} by org, "
+            f"{people_result['matched_by_date']:,} by date",
+            err=True,
+        )
+    if orgs:
+        canon_org_database = get_database(db_path=db_path_obj, readonly=False)
+        org_result = canon_org_database.canonicalize()
+        click.echo(
+            f"  Orgs: {org_result.get('groups_found', 0):,} groups",
+            err=True,
+        )
+        canon_org_database.close()
+
     database.close()
 
     click.echo("\nWikidata dump import complete!", err=True)
+    click.echo("Run `corp-extractor db post-import` to update search indexes.", err=True)
 
 
 @db_cmd.command("search-people")
 @click.argument("query")
 @click.option("--db", "db_path", type=click.Path(), help="Database path")
 @click.option("--top-k", type=int, default=10, help="Number of results")
+@click.option("--hybrid", is_flag=True, help="Use hybrid text + embeddings search (default is embeddings-only)")
 @click.option("-v", "--verbose", is_flag=True, help="Verbose output")
-def db_search_people(query: str, db_path: Optional[str], top_k: int, verbose: bool):
+def db_search_people(query: str, db_path: Optional[str], top_k: int, hybrid: bool, verbose: bool):
     """
     Search for a person in the database.
 
@@ -1883,19 +2096,18 @@ def db_search_people(query: str, db_path: Optional[str], top_k: int, verbose: bo
     Examples:
         corp-extractor db search-people "Tim Cook"
         corp-extractor db search-people "Elon Musk" --top-k 5
+        corp-extractor db search-people "Elon Musk" --hybrid
     """
     _configure_logging(verbose)
 
-    from .database.store import get_person_database, DEFAULT_DB_PATH
+    from .database.store import get_person_database
     from .database.embeddings import CompanyEmbedder
 
     # Default database path
-    if db_path is None:
-        db_path_obj = DEFAULT_DB_PATH
-    else:
-        db_path_obj = Path(db_path)
+    db_path_obj = _resolve_db_path(db_path)
 
-    click.echo(f"Searching for '{query}' in {db_path_obj}...", err=True)
+    mode = "hybrid (text + embeddings)" if hybrid else "embeddings-only"
+    click.echo(f"Searching for '{query}' in {db_path_obj} [{mode}]...", err=True)
 
     # Initialize components
     database = get_person_database(db_path=db_path_obj)
@@ -1903,7 +2115,8 @@ def db_search_people(query: str, db_path: Optional[str], top_k: int, verbose: bo
 
     # Embed query and search
     query_embedding = embedder.embed(query)
-    results = database.search(query_embedding, top_k=top_k, query_text=query)
+    query_text = query if hybrid else None
+    results = database.search(query_embedding, top_k=top_k, query_text=query_text)
 
     if not results:
         click.echo("No results found.", err=True)
@@ -1917,6 +2130,98 @@ def db_search_people(query: str, db_path: Optional[str], top_k: int, verbose: bo
         click.echo(f"  {i}. {record.name}{role_str}{org_str}{country_str}")
         click.echo(f"     Source: wikidata:{record.source_id}, Type: {record.person_type.value}, Score: {similarity:.3f}")
         click.echo()
+
+    database.close()
+
+
+@db_cmd.command("search-people-perf-test")
+@click.option("--db", "db_path", type=click.Path(), help="Database path")
+@click.option("--top-k", type=int, default=5, help="Number of results per query")
+@click.option("--hybrid", is_flag=True, help="Use hybrid text + embeddings search")
+@click.option("-v", "--verbose", is_flag=True, help="Verbose output")
+def db_search_people_perf_test(db_path: Optional[str], top_k: int, hybrid: bool, verbose: bool):
+    """
+    Run 20 sequential person searches to measure warm-up and steady-state latency.
+
+    \b
+    Examples:
+        corp-extractor db search-people-perf-test
+        corp-extractor db search-people-perf-test --hybrid
+    """
+    import time as _time
+
+    _configure_logging(verbose)
+
+    from .database.store import get_person_database
+    from .database.embeddings import CompanyEmbedder
+
+    test_queries = [
+        "Tim Cook, CEO, Apple",
+        "Satya Nadella, CEO, Microsoft",
+        "Andy Jassy, CEO, Amazon",
+        "Sundar Pichai, CEO, Google",
+        "Jensen Huang, CEO, NVIDIA",
+        "Mark Zuckerberg, CEO, Meta",
+        "Jamie Dimon, CEO, JPMorgan Chase",
+        "Warren Buffett, CEO, Berkshire Hathaway",
+        "Elon Musk, CEO, Tesla",
+        "Lisa Su, CEO, AMD",
+        "Mary Barra, CEO, General Motors",
+        "David Solomon, CEO, Goldman Sachs",
+        "Brian Moynihan, CEO, Bank of America",
+        "Arvind Krishna, CEO, IBM",
+        "Pat Gelsinger, CEO, Intel",
+        "Chuck Robbins, CEO, Cisco",
+        "Safra Catz, CEO, Oracle",
+        "Shantanu Narayen, CEO, Adobe",
+        "Marc Benioff, CEO, Salesforce",
+        "Darius Adamczyk, CEO, Honeywell",
+    ]
+
+    db_path_obj = _resolve_db_path(db_path)
+
+    mode = "hybrid" if hybrid else "embeddings-only"
+    click.echo(f"Person search perf test [{mode}] — {len(test_queries)} queries, top_k={top_k}", err=True)
+    click.echo(f"Database: {db_path_obj}", err=True)
+    click.echo("-" * 70, err=True)
+
+    database = get_person_database(db_path=db_path_obj)
+    embedder = CompanyEmbedder()
+
+    timings: list[tuple[str, float, int]] = []
+
+    for i, query in enumerate(test_queries, 1):
+        t0 = _time.perf_counter()
+        query_embedding = embedder.embed(query)
+        embed_elapsed = _time.perf_counter() - t0
+
+        t1 = _time.perf_counter()
+        query_text = query if hybrid else None
+        results = database.search(query_embedding, top_k=top_k, query_text=query_text)
+        search_elapsed = _time.perf_counter() - t1
+
+        total_elapsed = _time.perf_counter() - t0
+        n_results = len(results)
+        timings.append((query, total_elapsed, n_results))
+
+        top_match = results[0][0].name if results else "—"
+        top_score = f"{results[0][1]:.3f}" if results else "—"
+        click.echo(
+            f"  {i:2d}. {total_elapsed * 1000:7.1f}ms  "
+            f"(embed {embed_elapsed * 1000:.0f}ms + search {search_elapsed * 1000:.0f}ms)  "
+            f"hits={n_results:<3d}  "
+            f"top: {top_match} ({top_score})"
+        )
+
+    click.echo("-" * 70, err=True)
+    durations = [t for _, t, _ in timings]
+    click.echo(
+        f"Total: {sum(durations):.2f}s  |  "
+        f"Mean: {sum(durations) / len(durations) * 1000:.1f}ms  |  "
+        f"Min: {min(durations) * 1000:.1f}ms  |  "
+        f"Max: {max(durations) * 1000:.1f}ms",
+        err=True,
+    )
 
     database.close()
 
@@ -1967,8 +2272,9 @@ def db_import_companies_house(
     click.echo("Importing Companies House data...", err=True)
 
     # Initialize components (readonly=False for import operations)
+    db_path_obj = _resolve_db_path(db_path)
     embedder = CompanyEmbedder()
-    database = OrganizationDatabase(db_path=db_path, embedding_dim=embedder.embedding_dim, readonly=False)
+    database = OrganizationDatabase(db_path=db_path_obj, embedding_dim=embedder.embedding_dim, readonly=False)
     importer = CompaniesHouseImporter()
 
     # Get records
@@ -2011,6 +2317,7 @@ def db_import_companies_house(
         count += len(records)
 
     click.echo(f"\nImported {count} Companies House records successfully.", err=True)
+    click.echo("Run `corp-extractor db post-import` to update search indexes.", err=True)
     database.close()
 
 
@@ -2031,10 +2338,12 @@ def db_status(db_path: Optional[str], for_llm: bool):
 
     from .database import OrganizationDatabase
     from .database.hub import DEFAULT_DB_FILENAME, DEFAULT_DB_FULL_FILENAME, DEFAULT_DB_LITE_FILENAME
-    from .database.store import DEFAULT_DB_PATH, get_locations_database, get_person_database, get_roles_database
+    from .database.store import get_locations_database, get_person_database, get_roles_database
+
+    db_path_obj = _resolve_db_path(db_path)
 
     try:
-        database = OrganizationDatabase(db_path=db_path)
+        database = OrganizationDatabase(db_path=db_path_obj)
         stats = database.get_stats()
 
         click.echo("\nEntity Database Status")
@@ -2044,7 +2353,7 @@ def db_status(db_path: Optional[str], for_llm: bool):
         click.echo(f"Database size: {stats.database_size_bytes / 1024 / 1024:.2f} MB")
 
         # Get person stats
-        person_db = get_person_database(db_path=db_path)
+        person_db = get_person_database(db_path=db_path_obj)
         person_stats = person_db.get_stats()
         click.echo(f"Total people: {person_stats.get('total_records', 0):,}")
 
@@ -2065,9 +2374,9 @@ def db_status(db_path: Optional[str], for_llm: bool):
 
         # Roles and Locations counts
         try:
-            roles_db = get_roles_database(db_path=db_path)
+            roles_db = get_roles_database(db_path=db_path_obj)
             roles_stats = roles_db.get_stats()
-            locations_db = get_locations_database(db_path=db_path)
+            locations_db = get_locations_database(db_path=db_path_obj)
             locations_stats = locations_db.get_stats()
 
             click.echo("\n=== Other Tables ===")
@@ -2080,7 +2389,7 @@ def db_status(db_path: Optional[str], for_llm: bool):
 
         # For LLM mode: output enum tables and schema details
         if for_llm:
-            db_file = db_path or str(DEFAULT_DB_PATH)
+            db_file = str(db_path_obj)
             conn = sqlite3.connect(f"file:{db_file}?immutable=1", uri=True)
             conn.row_factory = sqlite3.Row
 
@@ -2093,7 +2402,7 @@ def db_status(db_path: Optional[str], for_llm: bool):
             click.echo(f"Default filename: {DEFAULT_DB_FILENAME}")
             click.echo(f"Full database: {DEFAULT_DB_FULL_FILENAME}")
             click.echo(f"Lite database: {DEFAULT_DB_LITE_FILENAME}")
-            click.echo(f"Default path: {DEFAULT_DB_PATH}")
+            click.echo(f"Default path: {_resolve_db_path()}")
 
             # Source types
             click.echo("\n=== source_types (Data Sources) ===")
@@ -2193,9 +2502,11 @@ def db_canonicalize(db_path: Optional[str], batch_size: int, verbose: bool):
     from .database import OrganizationDatabase
     from .database.store import get_person_database
 
+    db_path_obj = _resolve_db_path(db_path)
+
     try:
         # Canonicalize organizations (readonly=False for write operations)
-        database = OrganizationDatabase(db_path=db_path, readonly=False)
+        database = OrganizationDatabase(db_path=db_path_obj, readonly=False)
         click.echo("Running organization canonicalization...", err=True)
 
         result = database.canonicalize(batch_size=batch_size)
@@ -2210,7 +2521,6 @@ def db_canonicalize(db_path: Optional[str], batch_size: int, verbose: bool):
         database.close()
 
         # Canonicalize people (readonly=False for write operations)
-        db_path_obj = Path(db_path) if db_path else None
         person_db = get_person_database(db_path=db_path_obj, readonly=False)
         click.echo("\nRunning people canonicalization...", err=True)
 
@@ -2235,8 +2545,9 @@ def db_canonicalize(db_path: Optional[str], batch_size: int, verbose: bool):
 @click.option("--db", "db_path", type=click.Path(), help="Database path")
 @click.option("--top-k", type=int, default=10, help="Number of results")
 @click.option("--source", type=click.Choice(["gleif", "sec_edgar", "companies_house", "wikipedia"]), help="Filter by source")
+@click.option("--hybrid", is_flag=True, help="Use hybrid text + embeddings search (default is embeddings-only)")
 @click.option("-v", "--verbose", is_flag=True, help="Verbose output")
-def db_search(query: str, db_path: Optional[str], top_k: int, source: Optional[str], verbose: bool):
+def db_search(query: str, db_path: Optional[str], top_k: int, source: Optional[str], hybrid: bool, verbose: bool):
     """
     Search for an organization in the database.
 
@@ -2244,21 +2555,25 @@ def db_search(query: str, db_path: Optional[str], top_k: int, source: Optional[s
     Examples:
         corp-extractor db search "Apple Inc"
         corp-extractor db search "Microsoft" --source sec_edgar
+        corp-extractor db search "Apple" --hybrid
     """
     _configure_logging(verbose)
 
     from .database import OrganizationDatabase, CompanyEmbedder
 
+    db_path_obj = _resolve_db_path(db_path)
     embedder = CompanyEmbedder()
-    database = OrganizationDatabase(db_path=db_path)
+    database = OrganizationDatabase(db_path=db_path_obj)
 
-    click.echo(f"Searching for: {query}", err=True)
+    mode = "hybrid (text + embeddings)" if hybrid else "embeddings-only"
+    click.echo(f"Searching for '{query}' [{mode}]...", err=True)
 
     # Embed query
     query_embedding = embedder.embed(query)
 
     # Search
-    results = database.search(query_embedding, top_k=top_k, source_filter=source)
+    query_text = query if hybrid else None
+    results = database.search(query_embedding, top_k=top_k, source_filter=source, query_text=query_text)
 
     if not results:
         click.echo("No results found.")
@@ -2302,9 +2617,12 @@ def db_download(repo: str, db_path: Optional[str], full: bool, force: bool, verb
         corp-extractor db download --repo my-org/my-entity-db
     """
     _configure_logging(verbose)
-    from .database.hub import download_database
+    from .database.hub import download_database, db_filenames, USEARCH_INDEX_FILES
 
-    filename = "entities.db" if full else "entities-lite.db"
+    ctx = click.get_current_context(silent=True)
+    db_version = ctx.obj.get("db_version") if ctx and ctx.obj else None
+    full_fn, lite_fn, _ = db_filenames(db_version)
+    filename = full_fn if full else lite_fn
     click.echo(f"Downloading {'full ' if full else 'lite '}database from {repo}...", err=True)
 
     try:
@@ -2314,6 +2632,21 @@ def db_download(repo: str, db_path: Optional[str], full: bool, force: bool, verb
             force_download=force,
         )
         click.echo(f"Database downloaded to: {path}")
+
+        # Create v2 symlink for backwards compatibility
+        db_dir = path.parent
+        v2_link = db_dir / "entities-v2.db"
+        if not v2_link.exists():
+            v2_link.symlink_to(path.name)
+            click.echo(f"  Symlink: entities-v2.db -> {path.name}")
+
+        # Report USearch index file status
+        for idx_name in USEARCH_INDEX_FILES:
+            idx_path = db_dir / idx_name
+            if idx_path.exists():
+                click.echo(f"  Index: {idx_name} ({idx_path.stat().st_size / 1024**2:.0f} MB)")
+            else:
+                click.echo(f"  Index: {idx_name} (not found — run: corp-extractor db build-index)")
     except Exception as e:
         raise click.ClickException(f"Download failed: {e}")
 
@@ -2329,8 +2662,8 @@ def db_upload(db_path: Optional[str], repo: str, message: str, no_lite: bool, ve
     Upload entity database to HuggingFace Hub.
 
     First VACUUMs the database, then creates and uploads:
-    - entities.db (full database)
-    - entities-lite.db (without record data, smaller)
+    - Full database + lite variant (without record data or embeddings)
+    - USearch HNSW index files (.bin)
 
     If no path is provided, uploads from the default cache location.
     Requires HF_TOKEN environment variable to be set.
@@ -2343,11 +2676,15 @@ def db_upload(db_path: Optional[str], repo: str, message: str, no_lite: bool, ve
         corp-extractor db upload --repo my-org/my-entity-db
     """
     _configure_logging(verbose)
-    from .database.hub import upload_database_with_variants, DEFAULT_CACHE_DIR, DEFAULT_DB_FULL_FILENAME
+    from .database.hub import upload_database_with_variants, DEFAULT_CACHE_DIR, db_filenames
+
+    ctx = click.get_current_context(silent=True)
+    db_version = ctx.obj.get("db_version") if ctx and ctx.obj else None
+    full_fn, _, _ = db_filenames(db_version)
 
     # Use default cache location if no path provided
     if db_path is None:
-        db_path = str(DEFAULT_CACHE_DIR / DEFAULT_DB_FULL_FILENAME)
+        db_path = str(DEFAULT_CACHE_DIR / full_fn)
         if not Path(db_path).exists():
             raise click.ClickException(
                 f"Database not found at default location: {db_path}\n"
@@ -2365,6 +2702,7 @@ def db_upload(db_path: Optional[str], repo: str, message: str, no_lite: bool, ve
             repo_id=repo,
             commit_message=message,
             include_lite=not no_lite,
+            version=db_version,
         )
         click.echo(f"\nUploaded {len(results)} file(s) successfully:")
         for filename, url in results.items():
@@ -2379,11 +2717,10 @@ def db_upload(db_path: Optional[str], repo: str, message: str, no_lite: bool, ve
 @click.option("-v", "--verbose", is_flag=True, help="Verbose output")
 def db_create_lite(db_path: str, output: Optional[str], verbose: bool):
     """
-    Create a lite version of the database without record data.
+    Create a lite version of the database without record data or embeddings.
 
-    The lite version strips the `record` column (full source data),
-    keeping only core fields and embeddings. This significantly
-    reduces file size while maintaining search functionality.
+    The lite version strips the `record` column and drops all embedding
+    tables. Search uses USearch HNSW index files (.bin) instead.
 
     \b
     Examples:
@@ -2425,7 +2762,8 @@ def db_repair_embeddings(db_path: Optional[str], batch_size: int, source: Option
     from .database import OrganizationDatabase, CompanyEmbedder
 
     # readonly=False for write operations (embedding repair)
-    database = OrganizationDatabase(db_path=db_path, readonly=False)
+    db_path_obj = _resolve_db_path(db_path)
+    database = OrganizationDatabase(db_path=db_path_obj, readonly=False)
     embedder = CompanyEmbedder()
 
     # Check how many need repair
@@ -2466,6 +2804,52 @@ def db_repair_embeddings(db_path: Optional[str], batch_size: int, source: Option
     database.close()
 
 
+@db_cmd.command("rebuild-vec")
+@click.option("--db", "db_path", type=click.Path(), help="Database path")
+@click.option("-v", "--verbose", is_flag=True, help="Verbose output")
+def db_rebuild_vec(db_path: Optional[str], verbose: bool):
+    """
+    Rebuild vec0 embedding tables with distance_metric=cosine.
+
+    Required once for databases created before indexed KNN support was added.
+    This enables fast MATCH-based vector search instead of brute-force scans.
+
+    \b
+    Examples:
+        corp-extractor db rebuild-vec
+        corp-extractor db rebuild-vec --db /path/to/entities.db
+    """
+    _configure_logging(verbose)
+
+    from .database.store import (
+        get_database,
+        get_person_database,
+    )
+
+    db_path_obj = _resolve_db_path(db_path)
+
+    click.echo(f"Rebuilding vec0 tables in {db_path_obj}...", err=True)
+
+    # Rebuild organization embedding tables
+    click.echo("Rebuilding organization embedding tables...", err=True)
+    org_db = get_database(db_path=db_path_obj, readonly=False)
+    org_stats = org_db.rebuild_vec_tables()
+    for table, count in org_stats.items():
+        click.echo(f"  {table}: {count} rows", err=True)
+    org_db.close()
+
+    # Rebuild person embedding tables
+    click.echo("Rebuilding person embedding tables...", err=True)
+    person_db = get_person_database(db_path=db_path_obj, readonly=False)
+    person_stats = person_db.rebuild_vec_tables()
+    for table, count in person_stats.items():
+        click.echo(f"  {table}: {count} rows", err=True)
+    person_db.close()
+
+    total = sum(org_stats.values()) + sum(person_stats.values())
+    click.echo(f"\nDone. Rebuilt {total} total embeddings with cosine distance metric.", err=True)
+
+
 @db_cmd.command("backfill-scalar")
 @click.option("--db", "db_path", type=click.Path(), help="Database path")
 @click.option("--batch-size", type=int, default=10000, help="Batch size for processing (default: 10000)")
@@ -2494,10 +2878,11 @@ def db_backfill_scalar(db_path: Optional[str], batch_size: int, embed_batch_size
     from .database import OrganizationDatabase, CompanyEmbedder
     from .database.store import get_person_database
 
+    db_path_obj = _resolve_db_path(db_path)
     embedder = None  # Lazy load only if needed
 
     # Process organizations (readonly=False for write operations)
-    org_db = OrganizationDatabase(db_path=db_path, readonly=False)
+    org_db = OrganizationDatabase(db_path=db_path_obj, readonly=False)
 
     # Phase 1: Quantize existing float32 embeddings to scalar
     org_quantized = 0
@@ -2552,7 +2937,7 @@ def db_backfill_scalar(db_path: Optional[str], batch_size: int, embed_batch_size
         click.echo(f"Generated {org_generated:,} organization embeddings.", err=True)
 
     # Process people (readonly=False for write operations)
-    person_db = get_person_database(db_path=db_path, readonly=False)
+    person_db = get_person_database(db_path=db_path_obj, readonly=False)
 
     # Phase 1: Quantize existing float32 embeddings to scalar
     person_quantized = 0
@@ -2611,6 +2996,256 @@ def db_backfill_scalar(db_path: Optional[str], batch_size: int, embed_batch_size
     click.echo(f"  Organizations: {org_quantized:,} quantized, {org_generated:,} generated", err=True)
     click.echo(f"  People: {person_quantized:,} quantized, {person_generated:,} generated", err=True)
     click.echo(f"  Total: {org_quantized + org_generated + person_quantized + person_generated:,} embeddings processed", err=True)
+
+
+@db_cmd.command("build-index")
+@click.option("--db", "db_path", type=click.Path(), help="Database path")
+@click.option("--M", type=int, default=32, help="Number of connections per node (default 32)")
+@click.option("--ef-construction", type=int, default=200, help="Construction quality parameter (default 200)")
+@click.option("--ef-search", type=int, default=200, help="Search quality parameter (default 200)")
+@click.option("--people/--no-people", default=True, help="Build USearch index for people")
+@click.option("--orgs/--no-orgs", default=True, help="Build USearch index for organizations")
+@click.option("-v", "--verbose", is_flag=True, help="Verbose output")
+def db_build_index(db_path: Optional[str], m: int, ef_construction: int, ef_search: int, people: bool, orgs: bool, verbose: bool):
+    """
+    Build USearch index for fast approximate nearest neighbor search.
+
+    USearch uses HNSW algorithm (Hierarchical Navigable Small World) and provides
+    sub-millisecond query times on millions of vectors. Much faster than GPU or PCA approaches.
+
+    \b
+    Parameters:
+    - M: Higher = better quality, more memory (16-64, default 32)
+    - ef_construction: Higher = better quality, slower build (100-500, default 200)
+    - ef_search: Higher = better quality, slower search (50-500, default 200)
+
+    \b
+    Examples:
+        corp-extractor db build-index
+        corp-extractor db build-index --M 16              # Faster build, less memory
+        corp-extractor db build-index --M 64 --ef-construction 400   # Highest quality
+        corp-extractor db build-index --no-orgs           # People only
+    """
+    _configure_logging(verbose)
+
+    from .database.store import (
+        _get_shared_connection,
+        build_hnsw_index,
+    )
+
+    db_path_obj = _resolve_db_path(db_path)
+
+    if not db_path_obj.exists():
+        raise click.ClickException(f"Database not found: {db_path_obj}")
+
+    click.echo(f"Database: {db_path_obj}", err=True)
+    click.echo(f"Parameters: M={m}, ef_construction={ef_construction}, ef_search={ef_search}", err=True)
+
+    # Open read-only connection (we only read from scalar table)
+    conn = _get_shared_connection(db_path_obj, readonly=True)
+
+    if people:
+        click.echo("\n--- Building USearch index for people ---", err=True)
+
+        def people_progress(done: int, total: int) -> None:
+            click.echo(f"  Loaded {done:,}/{total:,} vectors...", err=True)
+
+        try:
+            count = build_hnsw_index(
+                conn, "people",
+                M=m,
+                ef_construction=ef_construction,
+                ef_search=ef_search,
+                progress_callback=people_progress,
+            )
+            click.echo(f"People USearch index: {count:,} vectors indexed", err=True)
+        except Exception as e:
+            raise click.ClickException(f"People USearch index build failed: {e}")
+
+    if orgs:
+        click.echo("\n--- Building USearch index for organizations ---", err=True)
+
+        def orgs_progress(done: int, total: int) -> None:
+            click.echo(f"  Loaded {done:,}/{total:,} vectors...", err=True)
+
+        try:
+            count = build_hnsw_index(
+                conn, "organizations",
+                M=m,
+                ef_construction=ef_construction,
+                ef_search=ef_search,
+                progress_callback=orgs_progress,
+            )
+            click.echo(f"Organizations USearch index: {count:,} vectors indexed", err=True)
+        except Exception as e:
+            raise click.ClickException(f"Organizations USearch index build failed: {e}")
+
+    click.echo("\nUSearch index build complete!", err=True)
+
+
+def _run_post_import(db_path_obj: Path, people: bool = True, orgs: bool = True, batch_size: int = 10000, embed_batch_size: int = 64) -> None:
+    """
+    Standard post-import steps: generate embeddings, build USearch indexes, VACUUM.
+
+    Called automatically after imports or manually via `db post-import`.
+    """
+    import sqlite3
+
+    import numpy as np
+
+    from .database import OrganizationDatabase, CompanyEmbedder
+    from .database.store import (
+        get_person_database,
+        _get_shared_connection,
+        build_hnsw_index,
+    )
+
+    embedder = None  # Lazy load
+
+    # --- Step 1: Generate embeddings for new records ---
+    click.echo("\n=== Step 1: Generate embeddings for new records ===", err=True)
+
+    if orgs:
+        org_db = OrganizationDatabase(db_path=db_path_obj, readonly=False)
+
+        # Quantize existing float32 → int8
+        org_quantized = 0
+        for batch_ids in org_db.get_missing_scalar_embedding_ids(batch_size=batch_size):
+            fp32_map = org_db.get_embeddings_by_ids(batch_ids)
+            if not fp32_map:
+                continue
+            ids = list(fp32_map.keys())
+            int8_embeddings = np.array([
+                np.clip(np.round(fp32_map[i] * 127), -127, 127).astype(np.int8)
+                for i in ids
+            ])
+            org_db.insert_scalar_embeddings_batch(ids, int8_embeddings)
+            org_quantized += len(ids)
+        if org_quantized:
+            click.echo(f"  Quantized {org_quantized:,} org embeddings (float32 → int8)", err=True)
+
+        # Generate both for records missing entirely
+        org_generated = 0
+        for batch in org_db.get_missing_all_embedding_ids(batch_size=batch_size):
+            if not batch:
+                continue
+            if embedder is None:
+                click.echo("  Loading embedding model...", err=True)
+                embedder = CompanyEmbedder()
+            for i in range(0, len(batch), embed_batch_size):
+                sub_batch = batch[i:i + embed_batch_size]
+                ids = [item[0] for item in sub_batch]
+                names = [item[1] for item in sub_batch]
+                fp32_batch, int8_batch = embedder.embed_batch_and_quantize(names, batch_size=embed_batch_size)
+                org_db.insert_both_embeddings_batch(ids, fp32_batch, int8_batch)
+                org_generated += len(ids)
+                if org_generated % 10000 == 0:
+                    click.echo(f"  Generated {org_generated:,} org embeddings...", err=True)
+        if org_generated:
+            click.echo(f"  Generated {org_generated:,} org embeddings", err=True)
+
+        if not org_quantized and not org_generated:
+            click.echo("  Organizations: all embeddings up to date", err=True)
+        org_db.close()
+
+    if people:
+        person_db = get_person_database(db_path=db_path_obj, readonly=False)
+
+        person_quantized = 0
+        for batch_ids in person_db.get_missing_scalar_embedding_ids(batch_size=batch_size):
+            fp32_map = person_db.get_embeddings_by_ids(batch_ids)
+            if not fp32_map:
+                continue
+            ids = list(fp32_map.keys())
+            int8_embeddings = np.array([
+                np.clip(np.round(fp32_map[i] * 127), -127, 127).astype(np.int8)
+                for i in ids
+            ])
+            person_db.insert_scalar_embeddings_batch(ids, int8_embeddings)
+            person_quantized += len(ids)
+        if person_quantized:
+            click.echo(f"  Quantized {person_quantized:,} person embeddings (float32 → int8)", err=True)
+
+        person_generated = 0
+        for batch in person_db.get_missing_all_embedding_ids(batch_size=batch_size):
+            if not batch:
+                continue
+            if embedder is None:
+                click.echo("  Loading embedding model...", err=True)
+                embedder = CompanyEmbedder()
+            for i in range(0, len(batch), embed_batch_size):
+                sub_batch = batch[i:i + embed_batch_size]
+                ids = [item[0] for item in sub_batch]
+                names = [item[1] for item in sub_batch]
+                fp32_batch, int8_batch = embedder.embed_batch_and_quantize(names, batch_size=embed_batch_size)
+                person_db.insert_both_embeddings_batch(ids, fp32_batch, int8_batch)
+                person_generated += len(ids)
+                if person_generated % 10000 == 0:
+                    click.echo(f"  Generated {person_generated:,} person embeddings...", err=True)
+        if person_generated:
+            click.echo(f"  Generated {person_generated:,} person embeddings", err=True)
+
+        if not person_quantized and not person_generated:
+            click.echo("  People: all embeddings up to date", err=True)
+        person_db.close()
+
+    # --- Step 2: Rebuild USearch indexes ---
+    click.echo("\n=== Step 2: Rebuild USearch indexes ===", err=True)
+
+    conn = _get_shared_connection(db_path_obj, readonly=True)
+
+    if people:
+        count = build_hnsw_index(conn, "people")
+        click.echo(f"  People USearch index: {count:,} vectors", err=True)
+
+    if orgs:
+        count = build_hnsw_index(conn, "organizations")
+        click.echo(f"  Organizations USearch index: {count:,} vectors", err=True)
+
+    # --- Step 3: VACUUM ---
+    click.echo("\n=== Step 3: VACUUM database ===", err=True)
+    vacuum_conn = sqlite3.connect(str(db_path_obj))
+    vacuum_conn.execute("VACUUM")
+    vacuum_conn.close()
+    db_size_mb = db_path_obj.stat().st_size / 1024**2
+    click.echo(f"  Database size after VACUUM: {db_size_mb:,.0f} MB", err=True)
+
+    click.echo("\nPost-import complete!", err=True)
+
+
+@db_cmd.command("post-import")
+@click.option("--db", "db_path", type=click.Path(), help="Database path")
+@click.option("--people/--no-people", default=True, help="Process people")
+@click.option("--orgs/--no-orgs", default=True, help="Process organizations")
+@click.option("--batch-size", type=int, default=10000, help="Batch size (default: 10000)")
+@click.option("-v", "--verbose", is_flag=True, help="Verbose output")
+def db_post_import(db_path: Optional[str], people: bool, orgs: bool, batch_size: int, verbose: bool):
+    """
+    Run standard post-import steps: embeddings, USearch indexes, VACUUM.
+
+    Run this after any import command to ensure search indexes are up to date.
+
+    \b
+    Steps:
+    1. Generate float32 + int8 embeddings for new records
+    2. Rebuild USearch HNSW indexes for fast search
+    3. VACUUM database to reclaim space
+
+    \b
+    Examples:
+        corp-extractor db post-import
+        corp-extractor db post-import --no-orgs     # People only
+        corp-extractor db post-import -v             # Verbose logging
+    """
+    _configure_logging(verbose)
+
+    db_path_obj = _resolve_db_path(db_path)
+
+    if not db_path_obj.exists():
+        raise click.ClickException(f"Database not found: {db_path_obj}")
+
+    click.echo(f"Database: {db_path_obj}", err=True)
+    _run_post_import(db_path_obj, people=people, orgs=orgs, batch_size=batch_size)
 
 
 @db_cmd.command("migrate")
@@ -2813,6 +3448,7 @@ def db_import_locations(from_pycountry: bool, db_path: Optional[str], verbose: b
     count = locations_db.import_from_pycountry()
 
     click.echo(f"Imported {count:,} locations from pycountry")
+    click.echo("Run `corp-extractor db post-import` to update search indexes.", err=True)
 
 
 # =============================================================================
@@ -2848,6 +3484,7 @@ def document_cmd():
 @click.option("--no-summary", is_flag=True, help="Skip document summarization")
 @click.option("--no-dedup", is_flag=True, help="Skip deduplication across chunks")
 @click.option("--use-ocr", is_flag=True, help="Force OCR for PDF parsing")
+@click.option("--pdf-parser", type=str, default=None, help="PDF parser plugin name (e.g., glm_ocr_parser)")
 @click.option(
     "--stages",
     type=str,
@@ -2872,6 +3509,7 @@ def document_process(
     no_summary: bool,
     no_dedup: bool,
     use_ocr: bool,
+    pdf_parser: Optional[str],
     stages: str,
     output: str,
     verbose: bool,
@@ -2880,11 +3518,12 @@ def document_process(
     """
     Process a document or URL through the extraction pipeline with chunking.
 
-    Supports text files, URLs (web pages and PDFs).
+    Supports text files, PDFs, and URLs (web pages and PDFs).
 
     \b
     Examples:
         corp-extractor document process article.txt
+        corp-extractor document process report.pdf --pdf-parser glm_ocr_parser
         corp-extractor document process report.txt --title "Annual Report" --year 2024
         corp-extractor document process https://example.com/article
         corp-extractor document process https://example.com/report.pdf --use-ocr
@@ -2935,7 +3574,10 @@ def document_process(
             if not quiet:
                 click.echo(f"Fetching URL: {input_source}", err=True)
 
-            loader_config = URLLoaderConfig(use_ocr=use_ocr)
+            loader_config = URLLoaderConfig(
+                use_ocr=use_ocr,
+                pdf_parser_plugin=pdf_parser,
+            )
             ctx = pipeline.process_url_sync(input_source, loader_config)
 
             if not quiet:
@@ -2949,25 +3591,79 @@ def document_process(
             if not os.path.exists(input_source):
                 raise click.ClickException(f"File not found: {input_source}")
 
-            # Read input file
-            with open(input_source, "r", encoding="utf-8") as f:
-                text = f.read()
+            file_path = Path(input_source)
 
-            if not text.strip():
-                raise click.ClickException("Input file is empty")
+            if file_path.suffix.lower() == ".pdf":
+                # Local PDF file — read as binary and run through PDF parser
+                pdf_bytes = file_path.read_bytes()
+                if not pdf_bytes:
+                    raise click.ClickException("PDF file is empty")
 
-            if not quiet:
-                click.echo(f"Processing document: {input_source} ({len(text)} chars)", err=True)
+                if not quiet:
+                    click.echo(
+                        f"Processing PDF: {input_source} ({len(pdf_bytes)} bytes)", err=True
+                    )
 
-            # Create document with metadata
-            doc_title = title or Path(input_source).stem
-            document = Document.from_text(
-                text=text,
-                title=doc_title,
-                source_type="text",
-                authors=list(authors),
-                year=year,
-            )
+                from .pipeline.registry import PluginRegistry
+
+                parsers = PluginRegistry.get_pdf_parsers()
+                if not parsers:
+                    raise click.ClickException("No PDF parser plugins registered")
+
+                parser = None
+                if pdf_parser:
+                    for p in parsers:
+                        if p.name == pdf_parser:
+                            parser = p
+                            break
+                    if parser is None:
+                        available = ", ".join(p.name for p in parsers)
+                        raise click.ClickException(
+                            f"PDF parser not found: {pdf_parser}. Available: {available}"
+                        )
+                else:
+                    parser = parsers[0]
+
+                if not quiet:
+                    click.echo(f"Using PDF parser: {parser.name}", err=True)
+
+                parse_result = parser.parse(pdf_bytes, use_ocr=use_ocr)
+                if not parse_result.ok:
+                    raise click.ClickException(f"PDF parsing failed: {parse_result.error}")
+
+                doc_title = title or parse_result.metadata.get("title") or file_path.stem
+                doc_authors = list(authors)
+                if not doc_authors and parse_result.metadata.get("author"):
+                    doc_authors = [parse_result.metadata["author"]]
+
+                document = Document.from_pages(
+                    pages=parse_result.pages,
+                    title=doc_title,
+                    source_type="pdf",
+                    authors=doc_authors,
+                    year=year,
+                )
+            else:
+                # Text file
+                with open(input_source, "r", encoding="utf-8") as f:
+                    text = f.read()
+
+                if not text.strip():
+                    raise click.ClickException("Input file is empty")
+
+                if not quiet:
+                    click.echo(
+                        f"Processing document: {input_source} ({len(text)} chars)", err=True
+                    )
+
+                doc_title = title or file_path.stem
+                document = Document.from_text(
+                    text=text,
+                    title=doc_title,
+                    source_type="text",
+                    authors=list(authors),
+                    year=year,
+                )
 
             ctx = pipeline.process(document)
 

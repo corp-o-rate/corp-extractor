@@ -99,7 +99,7 @@ class CompanyEmbedder:
         )
         return embedding.astype(np.float32)
 
-    def embed_batch(self, texts: list[str], batch_size: int = 32) -> np.ndarray:
+    def embed_batch(self, texts: list[str], batch_size: int = 192) -> np.ndarray:
         """
         Embed multiple texts in batches.
 
@@ -150,7 +150,7 @@ class CompanyEmbedder:
         return fp32, self.quantize_to_int8(fp32)
 
     def embed_batch_and_quantize(
-        self, texts: list[str], batch_size: int = 32
+        self, texts: list[str], batch_size: int = 192
     ) -> tuple[np.ndarray, np.ndarray]:
         """
         Embed multiple texts and return both float32 and int8 embeddings.

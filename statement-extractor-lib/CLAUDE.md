@@ -30,7 +30,8 @@ uv run corp-extractor plugins list           # List registered plugins
 # Entity database commands
 uv run corp-extractor db status              # Show database stats
 uv run corp-extractor db status --for-llm    # Output schema/enum tables for LLM docs
-uv run corp-extractor db search "Microsoft"  # Search for organization
+uv run corp-extractor db search "Microsoft"  # Search for organization (USearch HNSW)
+uv run corp-extractor db search "Microsoft" --hybrid  # Hybrid text + embeddings search
 uv run corp-extractor db search-people "Tim Cook"  # Search for person (v0.9.0)
 uv run corp-extractor db import-gleif --download --limit 10000  # Import GLEIF (2.6M records)
 uv run corp-extractor db import-sec --download                  # Import SEC bulk (73K filers)
@@ -51,20 +52,27 @@ uv run corp-extractor db import-wikidata-dump --dump dump.json.bz2 --skip-update
 uv run corp-extractor db import-wikidata-dump --download --require-enwiki  # Only orgs with English Wikipedia
 uv run corp-extractor db import-wikidata-dump --dump dump.bz2 --locations --no-people --no-orgs  # Locations only (v0.9.4)
 uv run corp-extractor db canonicalize        # Link equivalent records across sources
+uv run corp-extractor db build-index         # Build USearch HNSW index for fast ANN search
+uv run corp-extractor db rebuild-vec         # Rebuild vec0 tables with distance_metric=cosine
 uv run corp-extractor db search-roles "CEO"  # Search roles (v0.9.4)
 uv run corp-extractor db search-locations "California"  # Search locations (v0.9.4)
-uv run corp-extractor db upload              # Upload with lite/compressed variants
-uv run corp-extractor db download            # Download lite version (default)
-uv run corp-extractor db download --full     # Download full version
-uv run corp-extractor db create-lite entities.db  # Create lite version locally
+uv run corp-extractor db upload              # Upload with lite variant + USearch indexes
+uv run corp-extractor db download            # Download lite version + USearch indexes (default)
+uv run corp-extractor db download --full     # Download full version + USearch indexes
+uv run corp-extractor --db-version=2 db download  # Download v2 database files
+uv run corp-extractor db create-lite entities-v3.db  # Create lite version (drops embeddings)
 uv run corp-extractor db compress entities.db     # Compress with gzip
 uv run corp-extractor db migrate-v2 entities.db entities-v2.db  # Migrate to v2 schema (v0.9.4)
 uv run corp-extractor db backfill-scalar     # Generate int8 embeddings (v0.9.4)
+uv run corp-extractor db post-import         # Run after any import: embeddings + USearch + VACUUM
+uv run corp-extractor db post-import --no-orgs  # People only
 
 # Document processing commands
 uv run corp-extractor document process article.txt
+uv run corp-extractor document process report.pdf                                 # Local PDF support
+uv run corp-extractor document process report.pdf --pdf-parser glm_ocr_parser     # GLM-OCR VLM parser
 uv run corp-extractor document process https://example.com/article
-uv run corp-extractor document process report.pdf --use-ocr
+uv run corp-extractor document process https://example.com/report.pdf --use-ocr
 uv run corp-extractor document chunk article.txt --max-tokens 500
 ```
 
@@ -118,8 +126,8 @@ Plugins are sorted by `priority` property (lower = runs first). Default is 100.
 The `database/` module provides organization, person, role, and location embedding storage and search:
 
 - `database/models.py` - `CompanyRecord`, `CompanyMatch`, `PersonRecord`, `PersonMatch`, `PersonType`, `RoleRecord`, `LocationRecord`, `SimplifiedLocationType`, `DatabaseStats`, `EntityType` Pydantic models
-- `database/store.py` - `OrganizationDatabase`, `PersonDatabase`, `RolesDatabase`, `LocationsDatabase` SQLite+sqlite-vec storage (shared connection pool)
-- `database/embeddings.py` - `CompanyEmbedder` using google/embeddinggemma-300m (supports both float32 and int8 quantization)
+- `database/store.py` - `OrganizationDatabase`, `PersonDatabase`, `RolesDatabase`, `LocationsDatabase` SQLite+USearch storage (shared connection pool, HNSW indexes for ANN search)
+- `database/embeddings.py` - `CompanyEmbedder` using google/embeddinggemma-300m (supports both float32 and int8 quantization, batch_size=192)
 - `database/hub.py` - HuggingFace Hub upload/download with lite/compressed variants
 - `database/resolver.py` - `OrganizationResolver` shared utility for org lookups (used by person.py and embedding_company.py)
 - `database/schema_v2.py` - DDL for v2 normalized schema with INTEGER FK references (v0.9.4)
@@ -133,7 +141,7 @@ The `database/` module provides organization, person, role, and location embeddi
   - `companies_house_officers.py` - UK Companies House officers bulk data (Prod195, v0.9.3) - requires request to CH, 27.5M people
   - `wikidata.py` - Wikidata SPARQL queries (35+ entity types) - `from_date`/`to_date` from P571/P576
   - `wikidata_people.py` - Wikidata SPARQL queries for notable people - `from_date`/`to_date` from position qualifiers
-  - `wikidata_dump.py` - Wikidata JSON dump importer (~100GB) for people (13.4M), orgs (1.5M), and locations without SPARQL timeouts (v0.9.1, locations in v0.9.4)
+  - `wikidata_dump.py` - Wikidata JSON dump importer (~100GB) for people (36M), orgs (1.5M), and locations without SPARQL timeouts (v0.9.1, locations in v0.9.4). 3-thread parallel import (reader/embedder/writer). Multi-record person import (one per position+org). Supports orjson, indexed_bzip2, zstandard.
 
 **EntityType Classification:**
 Each organization record is classified with an `entity_type` field:
@@ -169,13 +177,21 @@ Each person record is classified with a `person_type` field:
 - `birth_date` and `death_date` fields track life dates; `is_historic` property for deceased people
 - `--require-enwiki` flag to only import orgs with English Wikipedia articles
 
-**Wikidata Dump Import Features (v0.9.4):**
+**Wikidata Dump Import Features (v0.9.5):**
+- 3-thread parallel pipeline: reader thread → embedder thread → writer thread for overlapping I/O, CPU encoding, and disk writes
+- Multi-record person import: creates one record per position+org combination (max 10 per person, deduped by role_qid+org_qid)
+- Reverse org→person mappings: extracts P580/P582 date qualifiers from executive properties (P169 CEO, P488 chairperson, etc.)
+- Auto-canonicalization after import with recency tiebreaker (most recent from_date preferred)
+- Optional `orjson` for ~3x faster JSON parsing (`pip install corp-extractor[fast-import]`)
+- Optional `indexed_bzip2` for parallel bzip2 decompression (6x faster with N cores)
+- Zstandard (.zst/.zstd) compressed dumps supported
 - Single-pass import: people, orgs, and locations are extracted in one scan of the ~100GB dump file
 - `--locations` flag to import geopolitical entities (countries, states, cities) with hierarchy
 - `--resume` flag to resume from last position in file (tracks entity index in progress file)
 - `--skip-updates` flag to skip Q codes already in database (no updates to existing records)
 - Progress file stored at `~/.cache/corp-extractor/wikidata-dump-progress.json`
 - Progress saved after each batch for reliable resume on interruption
+- All import commands output reminder to run `db post-import` after completion
 
 **Organization Canonicalization (v0.9.2):**
 The `db canonicalize` command links equivalent records across sources:
@@ -190,6 +206,14 @@ The `db canonicalize` command also links equivalent people records:
 - Records matched by normalized name + overlapping date ranges
 - Source priority: wikidata > sec_edgar > companies_house
 
+**Database Schema v3 (v0.9.6):**
+- `db_info` metadata table with `schema_version=3` for version detection
+- Lite databases drop ALL embedding tables (float32 + scalar int8) — uses USearch index files for search
+- `db upload` includes USearch `.bin` files alongside database variants
+- `db download` fetches USearch indexes alongside database
+- Global `--db-version` CLI flag for backwards compatibility (e.g. `corp-extractor --db-version=2 db download`)
+- Symlink `entities-v2.db` → v3 file created on download for backwards compat
+
 **Database Schema v2 (v0.9.4):**
 The database uses a normalized schema with INTEGER FK references instead of TEXT enum columns:
 - Enum lookup tables: `source_types`, `people_types`, `organization_types`, `location_types`, `simplified_location_types`
@@ -197,13 +221,20 @@ The database uses a normalized schema with INTEGER FK references instead of TEXT
 - QIDs stored as integers (Q prefix stripped) in `qid` column
 - Human-readable views: `organizations_view`, `people_view`, `roles_view`, `locations_view`
 - Both float32 and int8 scalar embeddings supported (75% storage reduction with ~92% recall)
-- Default database path: `~/.cache/corp-extractor/entities-v2.db`
+- USearch HNSW indexes for sub-millisecond approximate nearest neighbor search on 50M+ vectors
+- USearch index files: `people_usearch.bin`, `organizations_usearch.bin` (same dir as DB)
+- USearch `expansion_search` must be set to 200 after `Index.restore()` (not persisted by default)
+- Search modes: embeddings-only (default, uses USearch) or hybrid text+embeddings (`--hybrid` flag)
+- vec0 tables now use `distance_metric=cosine` for indexed KNN support
+- SQLite pragmas: 256MB mmap, 500MB page cache, WAL journal mode for write-heavy operations
+- Default database path: `~/.cache/corp-extractor/entities-v3.db`
 
 **Database variants:**
-- `entities-v2.db` - Full v2 database with normalized schema (v0.9.4+)
-- `entities.db` - Legacy v1 database (for migration)
-- `entities-lite.db` - Lite version without record data (default download, smaller)
-- `.gz` compressed versions for efficient transfer
+- `entities-v3.db` - Full v3 database with all embedding tables
+- `entities-v3-lite.db` - Lite version without record data or embedding tables (default download)
+- `organizations_usearch.bin` - USearch HNSW index for organizations
+- `people_usearch.bin` - USearch HNSW index for people
+- `entities-v2.db` - Legacy v2 symlink (backwards compatibility)
 
 ### Document Processing Module
 
@@ -218,7 +249,8 @@ The `document/` module provides document-level extraction:
 - `document/summarizer.py` - Document summarization
 
 **PDF and Scraper Plugins:**
-- `plugins/pdf/pypdf.py` - PDF parsing with PyMuPDF (optional OCR with pytesseract)
+- `plugins/pdf/pypdf.py` - Default PDF parser using PyMuPDF with Tesseract OCR fallback (priority 100)
+- `plugins/pdf/glm_ocr.py` - GLM-OCR 0.9B VLM parser for high-quality OCR of scans, tables, formulas (priority 200). Renders pages to images, runs in-process via HuggingFace transformers. Select with `--pdf-parser glm_ocr_parser`.
 - `plugins/scrapers/http.py` - HTTP/URL scraping with httpx
 
 ### Data Models Flow

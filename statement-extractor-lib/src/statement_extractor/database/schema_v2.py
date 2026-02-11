@@ -213,6 +213,17 @@ CREATE TABLE IF NOT EXISTS qid_labels (
 """
 
 # =============================================================================
+# METADATA TABLE
+# =============================================================================
+
+CREATE_DB_INFO = """
+CREATE TABLE IF NOT EXISTS db_info (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+"""
+
+# =============================================================================
 # EMBEDDING VIRTUAL TABLES
 # =============================================================================
 
@@ -221,7 +232,7 @@ def get_create_organization_embeddings(embedding_dim: int = 768) -> str:
     return f"""
 CREATE VIRTUAL TABLE IF NOT EXISTS organization_embeddings USING vec0(
     org_id INTEGER PRIMARY KEY,
-    embedding float[{embedding_dim}]
+    embedding float[{embedding_dim}] distance_metric=cosine
 );
 """
 
@@ -231,7 +242,7 @@ def get_create_person_embeddings(embedding_dim: int = 768) -> str:
     return f"""
 CREATE VIRTUAL TABLE IF NOT EXISTS person_embeddings USING vec0(
     person_id INTEGER PRIMARY KEY,
-    embedding float[{embedding_dim}]
+    embedding float[{embedding_dim}] distance_metric=cosine
 );
 """
 
@@ -241,7 +252,7 @@ def get_create_organization_embeddings_scalar(embedding_dim: int = 768) -> str:
     return f"""
 CREATE VIRTUAL TABLE IF NOT EXISTS organization_embeddings_scalar USING vec0(
     org_id INTEGER PRIMARY KEY,
-    embedding int8[{embedding_dim}]
+    embedding int8[{embedding_dim}] distance_metric=cosine
 );
 """
 
@@ -251,7 +262,7 @@ def get_create_person_embeddings_scalar(embedding_dim: int = 768) -> str:
     return f"""
 CREATE VIRTUAL TABLE IF NOT EXISTS person_embeddings_scalar USING vec0(
     person_id INTEGER PRIMARY KEY,
-    embedding int8[{embedding_dim}]
+    embedding int8[{embedding_dim}] distance_metric=cosine
 );
 """
 
@@ -370,6 +381,8 @@ ALL_DDL_STATEMENTS = [
     CREATE_PEOPLE_V2_INDEXES,
     # Reference tables
     CREATE_QID_LABELS_V2,
+    # Metadata
+    CREATE_DB_INFO,
 ]
 
 VIEW_DDL_STATEMENTS = [
@@ -405,5 +418,8 @@ def create_all_tables(conn, embedding_dim: int = 768) -> None:
     # Create views
     for ddl in VIEW_DDL_STATEMENTS:
         conn.execute(ddl)
+
+    # Set schema version
+    conn.execute("INSERT OR REPLACE INTO db_info (key, value) VALUES ('schema_version', '3')")
 
     conn.commit()

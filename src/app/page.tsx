@@ -329,8 +329,8 @@ export default function Home() {
                 >
                   GLiNER2
                 </a>{' '}
-                for entity extraction. Includes a database of 10M+ organizations and 40M+ people
-                with quantized embeddings for fast entity qualification (~100GB disk for all models and data).
+                for entity extraction. Includes a database of 9.7M+ organizations and 63M+ people
+                with USearch HNSW indexes for fast entity qualification (~100GB disk for all models and data).
               </p>
             </div>
 
@@ -464,7 +464,7 @@ export default function Home() {
               <ul className="list-disc list-inside space-y-1 ml-4">
                 <li><strong>T5-Gemma 2</strong> (540M params) — Splits text into atomic statements and resolves coreferences. Trained on 70,000+ pages of corporate and news documents.</li>
                 <li><strong>GLiNER2</strong> (205M params) — Extracts subject/predicate/object with entity types (ORG, PERSON, GPE, etc.) and 324 predefined predicates.</li>
-                <li><strong>Entity Database</strong> — Qualifies entities against 10M+ organizations and 40M+ people with quantized embeddings for sub-second lookups.</li>
+                <li><strong>Entity Database</strong> — Qualifies entities against 9.7M+ organizations and 63M+ people with USearch HNSW indexes for sub-millisecond lookups.</li>
                 <li><strong>BERT classifiers</strong> — Small models for sentiment labeling and embedding similarity for taxonomy classification.</li>
               </ul>
               <p>

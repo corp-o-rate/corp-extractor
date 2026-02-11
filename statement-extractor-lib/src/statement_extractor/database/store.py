@@ -1,9 +1,9 @@
 """
-Entity/Organization database with sqlite-vec for vector search.
+Entity/Organization database with USearch for vector search.
 
 Uses a hybrid approach:
 1. Text-based filtering to narrow candidates (Levenshtein-like)
-2. sqlite-vec vector search for semantic ranking
+2. USearch HNSW index for fast approximate nearest neighbor search
 """
 
 import json
@@ -45,8 +45,10 @@ from .seed_data import (
 
 logger = logging.getLogger(__name__)
 
+from .hub import DB_VERSION, DEFAULT_DB_FULL_FILENAME
+
 # Default database location
-DEFAULT_DB_PATH = Path.home() / ".cache" / "corp-extractor" / "entities-v2.db"
+DEFAULT_DB_PATH = Path.home() / ".cache" / "corp-extractor" / DEFAULT_DB_FULL_FILENAME
 
 # Module-level shared connections by path (both databases share the same connection)
 _shared_connections: dict[str, sqlite3.Connection] = {}
@@ -59,6 +61,25 @@ _database_instances: dict[str, "OrganizationDatabase"] = {}
 
 # Module-level singleton for PersonDatabase
 _person_database_instances: dict[str, "PersonDatabase"] = {}
+
+
+def _apply_pragmas(conn: sqlite3.Connection, readonly: bool) -> None:
+    """Apply performance PRAGMAs to a SQLite connection.
+
+    Uses 256MB mmap, in-memory temp store, and 500MB page cache.
+    USearch loads its index natively into memory, so we only need moderate
+    SQLite cache for record lookups and text filtering.
+    """
+    cache_kb = 500 * 1024  # 500 MB
+
+    conn.execute("PRAGMA mmap_size = 268435456")  # 256 MB memory-mapped I/O
+    conn.execute(f"PRAGMA cache_size = -{cache_kb}")
+    conn.execute("PRAGMA temp_store = MEMORY")
+    logger.debug(f"Applied PRAGMAs: mmap_size=256MB, cache_size={cache_kb // 1024}MB, temp_store=MEMORY")
+
+    if not readonly:
+        conn.execute("PRAGMA journal_mode = WAL")
+        logger.debug("Enabled WAL journal mode")
 
 
 def _get_shared_connection(
@@ -79,6 +100,8 @@ def _get_shared_connection(
             sqlite_vec.load(conn)
             conn.enable_load_extension(False)
 
+            _apply_pragmas(conn, readonly=True)
+
             _shared_readonly_connections[path_key] = conn
             logger.debug(f"Created shared read-only database connection for {path_key}")
 
@@ -95,6 +118,8 @@ def _get_shared_connection(
         conn.enable_load_extension(True)
         sqlite_vec.load(conn)
         conn.enable_load_extension(False)
+
+        _apply_pragmas(conn, readonly=False)
 
         _shared_connections[path_key] = conn
         logger.debug(f"Created shared database connection for {path_key}")
@@ -461,6 +486,17 @@ _PERSON_SUFFIXES = {
 }
 
 
+def _invert_date_str(date_str: str) -> str:
+    """Invert a date string for descending sort (most recent first).
+
+    Works by replacing each digit d with (9-d). Empty strings sort last
+    because the caller places them after entries with dates.
+    """
+    if not date_str:
+        return ""
+    return "".join(chr(ord("9") - ord(c) + ord("0")) if c.isdigit() else c for c in date_str)
+
+
 def _normalize_person_name(name: str) -> str:
     """
     Normalize person name for text matching.
@@ -502,6 +538,112 @@ def _normalize_person_name(name: str) -> str:
     normalized = re.sub(r'\s+', ' ', normalized).strip()
 
     return normalized if normalized else name.lower().strip()
+
+
+# ---------------------------------------------------------------------------
+# PCA spatial pre-filtering helpers
+# ---------------------------------------------------------------------------
+
+
+
+def build_hnsw_index(
+    conn: sqlite3.Connection,
+    entity_type: str,
+    embedding_dim: int = 768,
+    M: int = 32,
+    ef_construction: int = 200,
+    ef_search: int = 200,
+    progress_callback: Optional[Any] = None,
+) -> int:
+    """Build HNSW index for fast approximate nearest neighbor search.
+
+    Args:
+        conn: Read-only database connection
+        entity_type: 'people' or 'organizations'
+        embedding_dim: Dimension of embeddings (default 768)
+        M: Number of connections per node (default 32)
+        ef_construction: Size of dynamic candidate list during construction (default 200)
+        ef_search: Size of dynamic candidate list during search (default 200)
+        progress_callback: Optional callable(processed, total) for progress
+
+    Returns:
+        Number of vectors indexed
+    """
+    from usearch.index import Index
+
+    # Get database path for saving index
+    db_path = Path(conn.execute("PRAGMA database_list").fetchone()[2])
+    cache_dir = db_path.parent
+
+    if entity_type == "people":
+        embedding_table = "person_embeddings_scalar"
+        id_column = "person_id"
+        index_path = cache_dir / "people_usearch.bin"
+    elif entity_type == "organizations":
+        embedding_table = "organization_embeddings_scalar"
+        id_column = "org_id"
+        index_path = cache_dir / "organizations_usearch.bin"
+    else:
+        raise ValueError(f"Unknown entity_type: {entity_type}")
+
+    # Count total vectors
+    total_count = conn.execute(f"SELECT COUNT(*) FROM {embedding_table}").fetchone()[0]
+    if total_count == 0:
+        logger.warning(f"No embeddings found in {embedding_table}")
+        return 0
+
+    logger.info(f"Building USearch index for {total_count:,} {entity_type} vectors")
+    logger.info(f"Parameters: M={M}, ef_construction={ef_construction}, ef_search={ef_search}")
+    logger.info(f"Estimated time: ~{total_count / 1000 / 60:.0f}-{total_count / 500 / 60:.0f} minutes")
+
+    # Initialize USearch index with int8 quantization
+    index = Index(
+        ndim=embedding_dim,
+        metric='cos',  # cosine similarity
+        dtype='i8',  # int8 quantization
+        connectivity=M,
+        expansion_add=ef_construction,
+        expansion_search=ef_search,
+    )
+
+    # Fetch all embeddings
+    logger.info("Fetching embeddings from database...")
+    cursor = conn.execute(f"SELECT {id_column}, embedding FROM {embedding_table} ORDER BY {id_column}")
+
+    ids_list = []
+    vectors_list = []
+
+    for i, row in enumerate(cursor):
+        entity_id = row[id_column]
+        embedding_blob = row["embedding"]
+        # Keep as int8 for usearch
+        vec = np.frombuffer(embedding_blob, dtype=np.int8)
+
+        ids_list.append(entity_id)
+        vectors_list.append(vec)
+
+        if progress_callback and (i + 1) % 100000 == 0:
+            logger.info(f"Loaded {i + 1:,}/{total_count:,} vectors...")
+            progress_callback(i + 1, total_count)
+
+    logger.info(f"Loaded {len(ids_list):,} vectors, building index...")
+
+    # Convert to numpy arrays
+    ids_array = np.array(ids_list, dtype=np.int64)  # usearch requires int64 keys
+    vectors_array = np.stack(vectors_list)
+
+    # Add to index (usearch API: add(keys, vectors))
+    index.add(ids_array, vectors_array, threads=4)
+
+    # Save index
+    logger.info(f"Saving index to {index_path.name}...")
+    index.save(str(index_path))
+
+    index_size_mb = index_path.stat().st_size / 1024**2
+    logger.info(f"USearch index built successfully: {len(ids_array):,} vectors")
+    logger.info(f"  Index file: {index_path.name} ({index_size_mb:.1f} MB)")
+
+    return len(ids_array)
 
 
 def get_database(db_path: Optional[str | Path] = None, embedding_dim: int = 768, readonly: bool = True) -> "OrganizationDatabase":
@@ -552,6 +694,11 @@ class OrganizationDatabase:
         self._readonly = readonly
         self._conn: Optional[sqlite3.Connection] = None
         self._is_v2: Optional[bool] = None  # Detected on first connect
+        self._schema_version: int = 1  # Updated on connect (1=legacy, 2=normalized FKs, 3=no embeddings in lite)
+        # Cached flags
+        self._has_scalar_cached: Optional[bool] = None
+        # USearch index for fast approximate nearest neighbor search
+        self._hnsw_index: Optional[Any] = None  # usearch.index.Index
 
     def _ensure_dir(self) -> None:
         """Ensure database directory exists."""
@@ -571,7 +718,20 @@ class OrganizationDatabase:
             columns = {row["name"] for row in cursor}
             self._is_v2 = "entity_type_id" in columns
             if self._is_v2:
+                self._schema_version = 2
                 logger.debug("Detected v2 schema for organizations")
+
+            # Check for v3 metadata table
+            cursor = self._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='db_info'"
+            )
+            if cursor.fetchone():
+                row = self._conn.execute(
+                    "SELECT value FROM db_info WHERE key = 'schema_version'"
+                ).fetchone()
+                if row:
+                    self._schema_version = int(row[0])
+                    logger.debug(f"Detected schema version {self._schema_version} from db_info")
 
         # Create tables (idempotent) - only for v1 schema or fresh databases
         # v2 databases already have their schema from migration
@@ -665,7 +825,7 @@ class OrganizationDatabase:
         conn.execute(f"""
             CREATE VIRTUAL TABLE IF NOT EXISTS organization_embeddings USING vec0(
                 org_id INTEGER PRIMARY KEY,
-                embedding float[{self._embedding_dim}]
+                embedding float[{self._embedding_dim}] distance_metric=cosine
             )
         """)
 
@@ -674,7 +834,7 @@ class OrganizationDatabase:
         conn.execute(f"""
             CREATE VIRTUAL TABLE IF NOT EXISTS organization_embeddings_scalar USING vec0(
                 org_id INTEGER PRIMARY KEY,
-                embedding int8[{self._embedding_dim}]
+                embedding int8[{self._embedding_dim}] distance_metric=cosine
             )
         """)
 
@@ -861,7 +1021,7 @@ class OrganizationDatabase:
 
         Three-stage approach:
         1. If query_text provided, use SQL LIKE to find candidates containing search terms
-        2. Use sqlite-vec for vector similarity ranking on filtered candidates
+        2. USearch HNSW index for fast approximate nearest neighbor search
         3. Apply prominence-based re-ranking to boost major companies (SEC filers, tickers)
 
         Args:
@@ -878,20 +1038,19 @@ class OrganizationDatabase:
         start = time.time()
         self._connect()
 
+        # Log search mode
+        if query_text:
+            logger.info(f"Organization search: hybrid mode (text + embeddings) for '{query_text}'")
+        else:
+            logger.debug("Organization search: embeddings-only mode (fast KNN)")
+
         # Normalize query embedding
         query_norm = np.linalg.norm(query_embedding)
         if query_norm == 0:
             return []
         query_normalized = query_embedding / query_norm
 
-        # Use int8 quantized query if scalar table is available (75% storage savings)
-        if self._has_scalar_table():
-            query_int8 = self._quantize_query(query_normalized)
-            query_blob = query_int8.tobytes()
-        else:
-            query_blob = query_normalized.astype(np.float32).tobytes()
-
-        # Stage 1: Text-based pre-filtering (if query_text provided)
+        # Stage 1: Text filtering (if query_text provided)
         candidate_ids: Optional[set[int]] = None
         query_normalized_text = ""
         if query_text:
@@ -903,37 +1062,30 @@ class OrganizationDatabase:
                     source_filter=source_filter,
                 )
                 logger.info(f"Text filter: {len(candidate_ids)} candidates for '{query_text}'")
+                if len(candidate_ids) == 0:
+                    return []
 
-        # Stage 2: Vector search - fetch more candidates for re-ranking
-        if candidate_ids is not None and len(candidate_ids) == 0:
-            # No text matches, return empty
-            return []
+        # Stage 2: Vector ranking via USearch
+        query_int8 = np.clip(np.round(query_normalized * 127), -127, 127).astype(np.int8)
 
-        # Fetch enough candidates for prominence re-ranking to be effective
-        # Use at least rerank_min_candidates, or all text-filtered candidates if fewer
-        if candidate_ids is not None:
-            fetch_k = min(len(candidate_ids), max(rerank_min_candidates, top_k * 5))
-        else:
-            fetch_k = max(rerank_min_candidates, top_k * 5)
+        # Fetch extra results if we'll be re-ranking (hybrid mode)
+        fetch_k = max(rerank_min_candidates, top_k * 5) if query_normalized_text else top_k
 
-        if candidate_ids is not None:
-            # Search within text-filtered candidates
-            results = self._vector_search_filtered(
-                query_blob, candidate_ids, fetch_k, source_filter
-            )
-        else:
-            # Full vector search
-            results = self._vector_search_full(query_blob, fetch_k, source_filter)
+        if not self._load_hnsw_index():
+            raise RuntimeError("USearch index not found. Run: corp-extractor db build-index")
 
-        # Stage 3: Prominence-based re-ranking
+        results = self._hnsw_search(query_int8, fetch_k, candidate_ids, source_filter)
+
+        # Stage 3: Prominence-based re-ranking (hybrid mode only)
         if results and query_normalized_text:
+            logger.debug(f"Applying prominence re-ranking to {len(results)} candidates")
             results = self._apply_prominence_reranking(results, query_normalized_text, top_k)
         else:
             # No re-ranking, just trim to top_k
             results = results[:top_k]
 
         elapsed = time.time() - start
-        logger.debug(f"Hybrid search took {elapsed:.3f}s (results={len(results)})")
+        logger.debug(f"Organization search took {elapsed:.3f}s (results={len(results)})")
         return results
 
     def _calculate_prominence_boost(
@@ -1119,148 +1271,105 @@ class OrganizationDatabase:
         cursor = conn.execute(query, params)
         return set(row["id"] for row in cursor)
 
-    def _quantize_query(self, embedding: np.ndarray) -> np.ndarray:
-        """Quantize query embedding to int8 for scalar search."""
-        return np.clip(np.round(embedding * 127), -127, 127).astype(np.int8)
-
     def _has_scalar_table(self) -> bool:
-        """Check if scalar embedding table exists."""
+        """Check if scalar embedding table exists (cached)."""
+        if self._has_scalar_cached is not None:
+            return self._has_scalar_cached
         conn = self._conn
         assert conn is not None
         cursor = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='organization_embeddings_scalar'"
         )
-        return cursor.fetchone() is not None
+        result = cursor.fetchone() is not None
+        self._has_scalar_cached = result
+        return result
 
-    def _vector_search_filtered(
+    # --- USearch approximate nearest neighbor search ---
+
+    def _get_hnsw_index_path(self) -> Path:
+        """Get path to USearch index file."""
+        return self._db_path.parent / "organizations_usearch.bin"
+
+    def _load_hnsw_index(self) -> bool:
+        """
+        Load pre-built USearch index from disk.
+
+        Returns:
+            True if successfully loaded, False otherwise.
+        """
+        if self._hnsw_index is not None:
+            return True  # Already loaded
+
+        index_path = self._get_hnsw_index_path()
+        if not index_path.exists():
+            logger.debug(f"USearch index not found: {index_path}")
+            return False
+
+        try:
+            from usearch.index import Index
+
+            # Load index (IDs are stored in the index itself)
+            logger.info(f"Loading USearch index from {index_path.name}...")
+            index = Index.restore(str(index_path))
+            # USearch doesn't persist expansion_search — restore it for good recall on large indexes
+            index.expansion_search = 200
+            self._hnsw_index = index
+            logger.info(f"Loaded USearch index: {len(index):,} vectors, connectivity={index.connectivity}, ef_search={index.expansion_search}")
+            return True
+
+        except Exception as e:
+            logger.warning(f"Failed to load USearch index: {e}")
+            return False
+
+    def _hnsw_search(
         self,
-        query_blob: bytes,
-        candidate_ids: set[int],
+        query_int8: np.ndarray,
         top_k: int,
-        source_filter: Optional[str],
+        candidate_ids: Optional[set[int]] = None,
+        source_filter: Optional[str] = None,
     ) -> list[tuple[CompanyRecord, float]]:
-        """Vector search within a filtered set of candidates using scalar (int8) embeddings."""
-        conn = self._conn
-        assert conn is not None
+        """
+        Search using USearch index.
 
-        if not candidate_ids:
+        Args:
+            query_int8: Query embedding quantized to int8
+            top_k: Number of results to return
+            candidate_ids: Optional set of candidate IDs to filter results
+            source_filter: Optional source filter
+
+        Returns:
+            List of (CompanyRecord, similarity) tuples
+        """
+        if self._hnsw_index is None:
             return []
 
-        # Build IN clause for candidate IDs
-        placeholders = ",".join("?" * len(candidate_ids))
+        # Query USearch index (fetch more if we need to filter)
+        fetch_k = top_k * 10 if (candidate_ids or source_filter) else top_k
+        fetch_k = min(fetch_k, len(self._hnsw_index))
 
-        # Use scalar embedding table if available (75% storage reduction)
-        if self._has_scalar_table():
-            # Query uses int8 embeddings with vec_int8() wrapper
-            query = f"""
-                SELECT
-                    e.org_id,
-                    vec_distance_cosine(e.embedding, vec_int8(?)) as distance
-                FROM organization_embeddings_scalar e
-                WHERE e.org_id IN ({placeholders})
-                ORDER BY distance
-                LIMIT ?
-            """
-        else:
-            # Fall back to float32 embeddings
-            query = f"""
-                SELECT
-                    e.org_id,
-                    vec_distance_cosine(e.embedding, ?) as distance
-                FROM organization_embeddings e
-                WHERE e.org_id IN ({placeholders})
-                ORDER BY distance
-                LIMIT ?
-            """
+        matches = self._hnsw_index.search(query_int8, fetch_k)
 
-        cursor = conn.execute(query, [query_blob] + list(candidate_ids) + [top_k])
+        # Convert to results
+        results: list[tuple[CompanyRecord, float]] = []
+        for org_id, dist in zip(matches.keys, matches.distances):
+            org_id = int(org_id)
 
-        results = []
-        for row in cursor:
-            org_id = row["org_id"]
-            distance = row["distance"]
-            # Convert cosine distance to similarity (1 - distance)
-            similarity = 1.0 - distance
+            # Filter if needed
+            if candidate_ids and org_id not in candidate_ids:
+                continue
 
-            # Fetch full record
+            # Convert distance to similarity (cosine distance is 1 - cosine similarity)
+            similarity = 1.0 - float(dist)
+
             record = self._get_record_by_id(org_id)
-            if record:
+            if record is not None:
                 # Apply source filter if specified
                 if source_filter and record.source != source_filter:
                     continue
                 results.append((record, similarity))
 
-        return results
-
-    def _vector_search_full(
-        self,
-        query_blob: bytes,
-        top_k: int,
-        source_filter: Optional[str],
-    ) -> list[tuple[CompanyRecord, float]]:
-        """Full vector search without text pre-filtering using scalar (int8) embeddings."""
-        conn = self._conn
-        assert conn is not None
-
-        # Use scalar embedding table if available (75% storage reduction)
-        use_scalar = self._has_scalar_table()
-
-        # KNN search with sqlite-vec
-        if source_filter:
-            # Need to join with organizations table for source filter
-            if use_scalar:
-                query = """
-                    SELECT
-                        e.org_id,
-                        vec_distance_cosine(e.embedding, vec_int8(?)) as distance
-                    FROM organization_embeddings_scalar e
-                    JOIN organizations c ON e.org_id = c.id
-                    WHERE c.source = ?
-                    ORDER BY distance
-                    LIMIT ?
-                """
-            else:
-                query = """
-                    SELECT
-                        e.org_id,
-                        vec_distance_cosine(e.embedding, ?) as distance
-                    FROM organization_embeddings e
-                    JOIN organizations c ON e.org_id = c.id
-                    WHERE c.source = ?
-                    ORDER BY distance
-                    LIMIT ?
-                """
-            cursor = conn.execute(query, (query_blob, source_filter, top_k))
-        else:
-            if use_scalar:
-                query = """
-                    SELECT
-                        org_id,
-                        vec_distance_cosine(embedding, vec_int8(?)) as distance
-                    FROM organization_embeddings_scalar
-                    ORDER BY distance
-                    LIMIT ?
-                """
-            else:
-                query = """
-                    SELECT
-                        org_id,
-                        vec_distance_cosine(embedding, ?) as distance
-                    FROM organization_embeddings
-                    ORDER BY distance
-                    LIMIT ?
-                """
-            cursor = conn.execute(query, (query_blob, top_k))
-
-        results = []
-        for row in cursor:
-            org_id = row["org_id"]
-            distance = row["distance"]
-            similarity = 1.0 - distance
-
-            record = self._get_record_by_id(org_id)
-            if record:
-                results.append((record, similarity))
+            if len(results) >= top_k:
+                break
 
         return results
 
@@ -1994,7 +2103,7 @@ class OrganizationDatabase:
                     conn.execute(f"""
                         CREATE VIRTUAL TABLE organization_embeddings USING vec0(
                             org_id INTEGER PRIMARY KEY,
-                            embedding float[{self._embedding_dim}]
+                            embedding float[{self._embedding_dim}] distance_metric=cosine
                         )
                     """)
 
@@ -2115,11 +2224,71 @@ class OrganizationDatabase:
         conn.execute(f"""
             CREATE VIRTUAL TABLE IF NOT EXISTS organization_embeddings_scalar USING vec0(
                 org_id INTEGER PRIMARY KEY,
-                embedding int8[{self._embedding_dim}]
+                embedding int8[{self._embedding_dim}] distance_metric=cosine
             )
         """)
         conn.commit()
         logger.info("Ensured organization_embeddings_scalar table exists")
+
+    def rebuild_vec_tables(self) -> dict[str, int]:
+        """
+        Rebuild vec0 tables with distance_metric=cosine for indexed KNN search.
+
+        Drops and recreates each vec0 table, copying embeddings through a temp table.
+        Required once for databases created before the cosine metric was added.
+
+        Returns:
+            Dict with table names and row counts after rebuild.
+        """
+        conn = self._connect()
+        stats: dict[str, int] = {}
+
+        for table, id_col, dtype, vec_wrap in [
+            ("organization_embeddings", "org_id", f"float[{self._embedding_dim}]", None),
+            ("organization_embeddings_scalar", "org_id", f"int8[{self._embedding_dim}]", "vec_int8"),
+        ]:
+            # Check if table exists
+            cursor = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
+            )
+            if not cursor.fetchone():
+                logger.info(f"Table {table} does not exist, skipping")
+                stats[table] = 0
+                continue
+
+            count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            logger.info(f"Rebuilding {table} ({count} rows) with distance_metric=cosine...")
+
+            # Dump to temp table
+            conn.execute(f"CREATE TEMP TABLE _rebuild AS SELECT {id_col}, embedding FROM {table}")
+            conn.execute(f"DROP TABLE {table}")
+
+            # Recreate with cosine metric
+            conn.execute(f"""
+                CREATE VIRTUAL TABLE {table} USING vec0(
+                    {id_col} INTEGER PRIMARY KEY,
+                    embedding {dtype} distance_metric=cosine
+                )
+            """)
+
+            # Copy back
+            if vec_wrap:
+                conn.execute(f"""
+                    INSERT INTO {table} ({id_col}, embedding)
+                    SELECT {id_col}, {vec_wrap}(embedding) FROM _rebuild
+                """)
+            else:
+                conn.execute(f"""
+                    INSERT INTO {table} ({id_col}, embedding)
+                    SELECT {id_col}, embedding FROM _rebuild
+                """)
+
+            conn.execute("DROP TABLE _rebuild")
+            stats[table] = count
+            logger.info(f"Rebuilt {table}: {count} rows")
+
+        conn.commit()
+        return stats
 
     def get_missing_scalar_embedding_ids(self, batch_size: int = 1000) -> Iterator[list[int]]:
         """
@@ -2446,6 +2615,11 @@ class PersonDatabase:
         self._readonly = readonly
         self._conn: Optional[sqlite3.Connection] = None
         self._is_v2: Optional[bool] = None  # Detected on first connect
+        self._schema_version: int = 1  # Updated on connect (1=legacy, 2=normalized FKs, 3=no embeddings in lite)
+        # Cached flags
+        self._has_scalar_cached: Optional[bool] = None
+        # USearch index for fast approximate nearest neighbor search
+        self._hnsw_index: Optional[Any] = None  # usearch.index.Index
 
     def _ensure_dir(self) -> None:
         """Ensure database directory exists."""
@@ -2465,7 +2639,20 @@ class PersonDatabase:
             columns = {row["name"] for row in cursor}
             self._is_v2 = "person_type_id" in columns
             if self._is_v2:
+                self._schema_version = 2
                 logger.debug("Detected v2 schema for people")
+
+            # Check for v3 metadata table
+            cursor = self._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='db_info'"
+            )
+            if cursor.fetchone():
+                row = self._conn.execute(
+                    "SELECT value FROM db_info WHERE key = 'schema_version'"
+                ).fetchone()
+                if row:
+                    self._schema_version = int(row[0])
+                    logger.debug(f"Detected schema version {self._schema_version} from db_info")
 
         # Create tables (idempotent) - only for v1 schema or fresh databases
         # v2 databases already have their schema from migration
@@ -2585,7 +2772,7 @@ class PersonDatabase:
         conn.execute(f"""
             CREATE VIRTUAL TABLE IF NOT EXISTS person_embeddings USING vec0(
                 person_id INTEGER PRIMARY KEY,
-                embedding float[{self._embedding_dim}]
+                embedding float[{self._embedding_dim}] distance_metric=cosine
             )
         """)
 
@@ -2594,7 +2781,7 @@ class PersonDatabase:
         conn.execute(f"""
             CREATE VIRTUAL TABLE IF NOT EXISTS person_embeddings_scalar USING vec0(
                 person_id INTEGER PRIMARY KEY,
-                embedding int8[{self._embedding_dim}]
+                embedding int8[{self._embedding_dim}] distance_metric=cosine
             )
         """)
 
@@ -2794,12 +2981,18 @@ class PersonDatabase:
                     locations_db = get_locations_database(db_path=self._db_path, readonly=False)
                     country_id = locations_db.resolve_region_text(record.country)
 
+                # Resolve known_for_role to role_id if provided
+                role_id = None
+                if record.known_for_role:
+                    roles_db = get_roles_database(db_path=self._db_path, readonly=False)
+                    role_id = roles_db.get_or_create(record.known_for_role, source_id=source_type_id)
+
                 cursor = conn.execute("""
                     INSERT OR REPLACE INTO people
                     (name, name_normalized, source_id, source_identifier, country_id, person_type_id,
-                     known_for_org, known_for_org_id, from_date, to_date,
+                     known_for_role_id, known_for_org, known_for_org_id, from_date, to_date,
                      birth_date, death_date, record)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     record.name,
                     name_normalized,
@@ -2807,6 +3000,7 @@ class PersonDatabase:
                     record.source_id,
                     country_id,
                     person_type_id,
+                    role_id,
                     record.known_for_org,
                     record.known_for_org_id,  # Can be None
                     record.from_date or "",
@@ -2965,6 +3159,82 @@ class PersonDatabase:
         conn.commit()
         return True
 
+    def backfill_known_for_org(
+        self, qid_to_orgs: dict[str, list[tuple[str, str, Optional[str], Optional[str]]]]
+    ) -> int:
+        """
+        Backfill known_for_org (and dates) for people using QID→org mappings.
+
+        Only updates records where known_for_org is currently empty. Uses the
+        first reverse mapping entry for each person QID to fill in org label,
+        role, and from/to dates.
+
+        Args:
+            qid_to_orgs: Mapping of person Wikidata QID →
+                [(org_label, role_description, start_date, end_date), ...]
+
+        Returns:
+            Number of records updated
+        """
+        if not qid_to_orgs:
+            return 0
+
+        conn = self._connect()
+        updated = 0
+        for person_qid, entries in qid_to_orgs.items():
+            if not entries:
+                continue
+            # Use the first entry with an org label
+            org_label = ""
+            role = ""
+            start_date: Optional[str] = None
+            end_date: Optional[str] = None
+            for entry_org, entry_role, entry_start, entry_end in entries:
+                if entry_org:
+                    org_label = entry_org
+                    role = entry_role
+                    start_date = entry_start
+                    end_date = entry_end
+                    break
+            if not org_label:
+                continue
+
+            # Strip Q prefix if present for integer QID column
+            qid_int = int(person_qid.lstrip("Q")) if person_qid.startswith("Q") else None
+            if qid_int is None:
+                continue
+
+            # Resolve role to role_id for v2 schema
+            role_id = None
+            if role and self._is_v2:
+                roles_db = get_roles_database(db_path=self._db_path, readonly=False)
+                role_id = roles_db.get_or_create(role, source_id=4)  # 4 = wikidata
+
+            # Update records missing known_for_org, also backfill dates and role
+            if self._is_v2:
+                result = conn.execute(
+                    """UPDATE people SET known_for_org = ?,
+                       known_for_role_id = COALESCE(known_for_role_id, ?),
+                       from_date = CASE WHEN from_date IS NULL OR from_date = '' THEN ? ELSE from_date END,
+                       to_date = CASE WHEN to_date IS NULL OR to_date = '' THEN ? ELSE to_date END
+                    WHERE qid = ? AND (known_for_org = '' OR known_for_org IS NULL)""",
+                    (org_label, role_id, start_date or "", end_date or "", qid_int),
+                )
+            else:
+                result = conn.execute(
+                    """UPDATE people SET known_for_org = ?,
+                       known_for_role = CASE WHEN known_for_role = '' OR known_for_role IS NULL THEN ? ELSE known_for_role END,
+                       from_date = CASE WHEN from_date IS NULL OR from_date = '' THEN ? ELSE from_date END,
+                       to_date = CASE WHEN to_date IS NULL OR to_date = '' THEN ? ELSE to_date END
+                    WHERE source_id = ? AND source = 'wikidata' AND (known_for_org = '' OR known_for_org IS NULL)""",
+                    (org_label, role, start_date or "", end_date or "", person_qid),
+                )
+            updated += result.rowcount
+            if updated % 1000 == 0 and updated > 0:
+                conn.commit()
+        conn.commit()
+        return updated
+
     def search(
         self,
         query_embedding: np.ndarray,
@@ -2977,7 +3247,7 @@ class PersonDatabase:
 
         Two-stage approach:
         1. If query_text provided, use SQL LIKE to find candidates containing search terms
-        2. Use sqlite-vec for vector similarity ranking on filtered candidates
+        2. USearch HNSW index for fast approximate nearest neighbor search
 
         Args:
             query_embedding: Query embedding vector
@@ -2991,20 +3261,19 @@ class PersonDatabase:
         start = time.time()
         self._connect()
 
+        # Log search mode
+        if query_text:
+            logger.info(f"Person search: hybrid mode (text + embeddings) for '{query_text}'")
+        else:
+            logger.debug("Person search: embeddings-only mode (fast KNN)")
+
         # Normalize query embedding
         query_norm = np.linalg.norm(query_embedding)
         if query_norm == 0:
             return []
         query_normalized = query_embedding / query_norm
 
-        # Use int8 quantized query if scalar table is available (75% storage savings)
-        if self._has_scalar_table():
-            query_int8 = self._quantize_query(query_normalized)
-            query_blob = query_int8.tobytes()
-        else:
-            query_blob = query_normalized.astype(np.float32).tobytes()
-
-        # Stage 1: Text-based pre-filtering (if query_text provided)
+        # Stage 1: Text filtering (if query_text provided)
         candidate_ids: Optional[set[int]] = None
         if query_text:
             query_normalized_text = _normalize_person_name(query_text)
@@ -3014,20 +3283,16 @@ class PersonDatabase:
                     max_candidates=max_text_candidates,
                 )
                 logger.info(f"Text filter: {len(candidate_ids)} candidates for '{query_text}'")
+                if len(candidate_ids) == 0:
+                    return []
 
-        # Stage 2: Vector search
-        if candidate_ids is not None and len(candidate_ids) == 0:
-            # No text matches, return empty
-            return []
+        # Stage 2: Vector ranking via USearch
+        query_int8 = np.clip(np.round(query_normalized * 127), -127, 127).astype(np.int8)
 
-        if candidate_ids is not None:
-            # Search within text-filtered candidates
-            results = self._vector_search_filtered(
-                query_blob, candidate_ids, top_k
-            )
-        else:
-            # Full vector search
-            results = self._vector_search_full(query_blob, top_k)
+        if not self._load_hnsw_index():
+            raise RuntimeError("USearch index not found. Run: corp-extractor db build-index")
+
+        results = self._hnsw_search(query_int8, top_k, candidate_ids)
 
         elapsed = time.time() - start
         logger.debug(f"Person search took {elapsed:.3f}s (results={len(results)})")
@@ -3073,112 +3338,100 @@ class PersonDatabase:
         cursor = conn.execute(query, params)
         return set(row["id"] for row in cursor)
 
-    def _quantize_query(self, embedding: np.ndarray) -> np.ndarray:
-        """Quantize query embedding to int8 for scalar search."""
-        return np.clip(np.round(embedding * 127), -127, 127).astype(np.int8)
-
     def _has_scalar_table(self) -> bool:
-        """Check if scalar embedding table exists."""
+        """Check if scalar embedding table exists (cached)."""
+        if self._has_scalar_cached is not None:
+            return self._has_scalar_cached
         conn = self._conn
         assert conn is not None
         cursor = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='person_embeddings_scalar'"
         )
-        return cursor.fetchone() is not None
+        result = cursor.fetchone() is not None
+        self._has_scalar_cached = result
+        return result
 
-    def _vector_search_filtered(
+    # --- USearch approximate nearest neighbor search ---
+
+    def _get_hnsw_index_path(self) -> Path:
+        """Get path to USearch index file."""
+        return self._db_path.parent / "people_usearch.bin"
+
+    def _load_hnsw_index(self) -> bool:
+        """
+        Load pre-built USearch index from disk.
+
+        Returns:
+            True if successfully loaded, False otherwise.
+        """
+        if self._hnsw_index is not None:
+            return True  # Already loaded
+
+        index_path = self._get_hnsw_index_path()
+        if not index_path.exists():
+            logger.debug(f"USearch index not found: {index_path}")
+            return False
+
+        try:
+            from usearch.index import Index
+
+            # Load index (IDs are stored in the index itself)
+            logger.info(f"Loading USearch index from {index_path.name}...")
+            index = Index.restore(str(index_path))
+            # USearch doesn't persist expansion_search — restore it for good recall on large indexes
+            index.expansion_search = 200
+            self._hnsw_index = index
+            logger.info(f"Loaded USearch index: {len(index):,} vectors, connectivity={index.connectivity}, ef_search={index.expansion_search}")
+            return True
+
+        except Exception as e:
+            logger.warning(f"Failed to load USearch index: {e}")
+            return False
+
+    def _hnsw_search(
         self,
-        query_blob: bytes,
-        candidate_ids: set[int],
+        query_int8: np.ndarray,
         top_k: int,
+        candidate_ids: Optional[set[int]] = None,
     ) -> list[tuple[PersonRecord, float]]:
-        """Vector search within a filtered set of candidates using scalar (int8) embeddings."""
-        conn = self._conn
-        assert conn is not None
+        """
+        Search using USearch index.
 
-        if not candidate_ids:
+        Args:
+            query_int8: Query embedding quantized to int8
+            top_k: Number of results to return
+            candidate_ids: Optional set of candidate IDs to filter results
+
+        Returns:
+            List of (PersonRecord, similarity) tuples
+        """
+        if self._hnsw_index is None:
             return []
 
-        # Build IN clause for candidate IDs
-        placeholders = ",".join("?" * len(candidate_ids))
+        # Query USearch index (fetch more if we need to filter)
+        fetch_k = top_k * 10 if candidate_ids else top_k
+        fetch_k = min(fetch_k, len(self._hnsw_index))
 
-        # Use scalar embedding table if available (75% storage reduction)
-        if self._has_scalar_table():
-            query = f"""
-                SELECT
-                    e.person_id,
-                    vec_distance_cosine(e.embedding, vec_int8(?)) as distance
-                FROM person_embeddings_scalar e
-                WHERE e.person_id IN ({placeholders})
-                ORDER BY distance
-                LIMIT ?
-            """
-        else:
-            query = f"""
-                SELECT
-                    e.person_id,
-                    vec_distance_cosine(e.embedding, ?) as distance
-                FROM person_embeddings e
-                WHERE e.person_id IN ({placeholders})
-                ORDER BY distance
-                LIMIT ?
-            """
+        matches = self._hnsw_index.search(query_int8, fetch_k)
 
-        cursor = conn.execute(query, [query_blob] + list(candidate_ids) + [top_k])
+        # Convert to results
+        results: list[tuple[PersonRecord, float]] = []
+        for person_id, dist in zip(matches.keys, matches.distances):
+            person_id = int(person_id)
 
-        results = []
-        for row in cursor:
-            person_id = row["person_id"]
-            distance = row["distance"]
-            # Convert cosine distance to similarity (1 - distance)
-            similarity = 1.0 - distance
+            # Filter if needed
+            if candidate_ids and person_id not in candidate_ids:
+                continue
 
-            # Fetch full record
-            record = self._get_record_by_id(person_id)
-            if record:
-                results.append((record, similarity))
-
-        return results
-
-    def _vector_search_full(
-        self,
-        query_blob: bytes,
-        top_k: int,
-    ) -> list[tuple[PersonRecord, float]]:
-        """Full vector search without text pre-filtering using scalar (int8) embeddings."""
-        conn = self._conn
-        assert conn is not None
-
-        # Use scalar embedding table if available (75% storage reduction)
-        if self._has_scalar_table():
-            query = """
-                SELECT
-                    person_id,
-                    vec_distance_cosine(embedding, vec_int8(?)) as distance
-                FROM person_embeddings_scalar
-                ORDER BY distance
-                LIMIT ?
-            """
-        else:
-            query = """
-                SELECT
-                    person_id,
-                    vec_distance_cosine(embedding, ?) as distance
-                FROM person_embeddings
-                ORDER BY distance
-                LIMIT ?
-            """
-        cursor = conn.execute(query, (query_blob, top_k))
-
-        results = []
-        for row in cursor:
-            person_id = row["person_id"]
-            distance = row["distance"]
-            similarity = 1.0 - distance
+            # Convert distance to similarity (cosine distance is 1 - cosine similarity)
+            similarity = 1.0 - float(dist)
 
             record = self._get_record_by_id(person_id)
-            if record:
+            if record is not None:
                 results.append((record, similarity))
+
+            if len(results) >= top_k:
+                break
 
         return results
 
@@ -3308,11 +3561,67 @@ class PersonDatabase:
         conn.execute(f"""
             CREATE VIRTUAL TABLE IF NOT EXISTS person_embeddings_scalar USING vec0(
                 person_id INTEGER PRIMARY KEY,
-                embedding int8[{self._embedding_dim}]
+                embedding int8[{self._embedding_dim}] distance_metric=cosine
             )
         """)
         conn.commit()
         logger.info("Ensured person_embeddings_scalar table exists")
+
+    def rebuild_vec_tables(self) -> dict[str, int]:
+        """
+        Rebuild vec0 tables with distance_metric=cosine for indexed KNN search.
+
+        Drops and recreates each vec0 table, copying embeddings through a temp table.
+        Required once for databases created before the cosine metric was added.
+
+        Returns:
+            Dict with table names and row counts after rebuild.
+        """
+        conn = self._connect()
+        stats: dict[str, int] = {}
+
+        for table, id_col, dtype, vec_wrap in [
+            ("person_embeddings", "person_id", f"float[{self._embedding_dim}]", None),
+            ("person_embeddings_scalar", "person_id", f"int8[{self._embedding_dim}]", "vec_int8"),
+        ]:
+            cursor = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
+            )
+            if not cursor.fetchone():
+                logger.info(f"Table {table} does not exist, skipping")
+                stats[table] = 0
+                continue
+
+            count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            logger.info(f"Rebuilding {table} ({count} rows) with distance_metric=cosine...")
+
+            conn.execute(f"CREATE TEMP TABLE _rebuild AS SELECT {id_col}, embedding FROM {table}")
+            conn.execute(f"DROP TABLE {table}")
+
+            conn.execute(f"""
+                CREATE VIRTUAL TABLE {table} USING vec0(
+                    {id_col} INTEGER PRIMARY KEY,
+                    embedding {dtype} distance_metric=cosine
+                )
+            """)
+
+            if vec_wrap:
+                conn.execute(f"""
+                    INSERT INTO {table} ({id_col}, embedding)
+                    SELECT {id_col}, {vec_wrap}(embedding) FROM _rebuild
+                """)
+            else:
+                conn.execute(f"""
+                    INSERT INTO {table} ({id_col}, embedding)
+                    SELECT {id_col}, embedding FROM _rebuild
+                """)
+
+            conn.execute("DROP TABLE _rebuild")
+            stats[table] = count
+            logger.info(f"Rebuilt {table}: {count} rows")
+
+        conn.commit()
+        return stats
 
     def get_missing_scalar_embedding_ids(self, batch_size: int = 1000) -> Iterator[list[int]]:
         """
@@ -3953,8 +4262,9 @@ class PersonDatabase:
         # Get all groups and select canonical record for each
         groups = uf.groups()
 
-        # Build id -> source mapping
+        # Build id -> source and id -> from_date mappings
         id_to_source = {p["id"]: p["source"] for p in people}
+        id_to_from_date = {p["id"]: p["from_date"] or "" for p in people}
 
         batch_updates: list[tuple[int, int, int]] = []  # (person_id, canon_id, canon_size)
 
@@ -3967,10 +4277,15 @@ class PersonDatabase:
                 batch_updates.append((person_id, person_id, 1))
             else:
                 # Multiple records - pick highest priority source as canonical
-                # Sort by source priority, then by id (for stability)
+                # Sort by: source priority asc, has-date first, from_date desc (most recent), id asc
                 sorted_ids = sorted(
                     group_ids,
-                    key=lambda pid: (PERSON_SOURCE_PRIORITY.get(id_to_source[pid], 99), pid)
+                    key=lambda pid: (
+                        PERSON_SOURCE_PRIORITY.get(id_to_source[pid], 99),
+                        0 if id_to_from_date[pid] else 1,  # entries with dates first
+                        _invert_date_str(id_to_from_date[pid]),  # most recent date first
+                        pid,
+                    )
                 )
                 canon_id = sorted_ids[0]
                 stats["canonical_groups"] += 1

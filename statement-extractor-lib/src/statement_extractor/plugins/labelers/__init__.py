@@ -17,6 +17,7 @@ from .confidence import ConfidenceLabeler
 # NOT auto-registered as Stage 5 labelers (use Stage 6 taxonomy plugins instead)
 from .taxonomy import TaxonomyLabeler
 from .taxonomy_embedding import EmbeddingTaxonomyLabeler
+from .hf_classifier import HuggingFaceClassifierLabeler
 
 __all__ = [
     "BaseLabelerPlugin",
@@ -26,4 +27,6 @@ __all__ = [
     # Taxonomy labelers (not auto-registered - for manual use only)
     "TaxonomyLabeler",
     "EmbeddingTaxonomyLabeler",
+    # HuggingFace classifier (not auto-registered - requires constructor args)
+    "HuggingFaceClassifierLabeler",
 ]

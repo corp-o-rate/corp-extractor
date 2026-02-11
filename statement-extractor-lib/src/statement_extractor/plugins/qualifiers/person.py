@@ -331,12 +331,11 @@ class PersonQualifierPlugin(BaseQualifierPlugin):
         logger.debug(f"    Embedding query: '{query_text}'")
         query_embedding = embedder.embed(query_text)
 
-        # Search database with text pre-filtering on name only
+        # Search database with embeddings-only (fast KNN MATCH path)
         logger.debug(f"    Searching person database...")
         results = database.search(
             query_embedding,
             top_k=self._top_k * 3,  # Fetch more to allow for org filtering
-            query_text=person_name,
         )
 
         logger.debug(f"    Database returned {len(results)} raw results")

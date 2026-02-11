@@ -419,9 +419,14 @@ The `document` command processes files, URLs, and PDFs with automatic chunking a
 corp-extractor document process article.txt
 corp-extractor document process report.txt --title "Annual Report" --year 2024
 
+# Process local PDFs (auto-detected by .pdf extension)
+corp-extractor document process report.pdf
+corp-extractor document process report.pdf --pdf-parser glm_ocr_parser
+
 # Process URLs (web pages and PDFs)
 corp-extractor document process https://example.com/article
 corp-extractor document process https://example.com/report.pdf --use-ocr
+corp-extractor document process https://example.com/report.pdf --pdf-parser glm_ocr_parser
 
 # Configure chunking
 corp-extractor document process article.txt --max-tokens 500 --overlap 50
@@ -466,6 +471,11 @@ corp-extractor document process article.txt -o triples
       <td>—</td>
     </tr>
     <tr>
+      <td><code>--pdf-parser</code></td>
+      <td>PDF parser plugin name (e.g., <code>glm_ocr_parser</code>)</td>
+      <td>Auto (lowest priority)</td>
+    </tr>
+    <tr>
       <td><code>--no-summary</code></td>
       <td>Skip document summarization</td>
       <td>—</td>
@@ -489,20 +499,24 @@ corp-extractor document process article.txt -o triples
 
 <span id="db-commands" />
 
-<span className="text-xs font-medium bg-green-100 dark:bg-green-900 text-green-800 dark:text-green-200 px-2 py-0.5 rounded">UPDATED in v0.9.4</span>
+<span className="text-xs font-medium bg-green-100 dark:bg-green-900 text-green-800 dark:text-green-200 px-2 py-0.5 rounded">UPDATED in v0.9.6</span>
 
 The `db` command group manages the entity embedding database used for organization, person, role, and location qualification.
+
+**Global `--db-version` flag** <span className="text-xs font-medium bg-green-100 dark:bg-green-900 text-green-800 dark:text-green-200 px-2 py-0.5 rounded">v0.9.6</span>: Controls which database version filenames are used. Defaults to the latest (v3). Use `corp-extractor --db-version=2 db download` to fetch v2 files. On download, a backwards-compatibility symlink `entities-v2.db` → `entities-v3.db` is created automatically.
 
 ```bash
 # Show database status
 corp-extractor db status
 
-# Search for an organization
+# Search for an organization (USearch HNSW)
 corp-extractor db search "Microsoft"
+corp-extractor db search "Microsoft" --hybrid      # Hybrid text + embeddings search
 corp-extractor db search "Barclays" --source companies_house
 
 # Search for a person (v0.9.0)
 corp-extractor db search-people "Tim Cook"
+corp-extractor db search-people "Tim Cook" --hybrid  # Hybrid text + embeddings search
 corp-extractor db search-people "Elon Musk" --top-k 5
 
 # Search for roles (v0.9.4)
@@ -527,10 +541,11 @@ corp-extractor db import-people --all --limit 10000  # All person types
 corp-extractor db import-wikidata-dump --download --limit 50000
 corp-extractor db import-wikidata-dump --dump /path/to/dump.bz2 --people --no-orgs
 
-# Download/upload from HuggingFace Hub
-corp-extractor db download                        # Lite version (default)
-corp-extractor db download --full                 # Full version with metadata
-corp-extractor db upload                          # Upload with all variants
+# Download/upload from HuggingFace Hub (includes USearch indexes)
+corp-extractor db download                        # Lite version + USearch indexes (default)
+corp-extractor db download --full                 # Full version + USearch indexes
+corp-extractor db upload                          # Upload with lite variant + USearch indexes
+corp-extractor --db-version=2 db download         # Download v2 database files
 
 # Migrate from old schema (companies.db → entities.db)
 corp-extractor db migrate companies.db --rename-file
@@ -543,9 +558,19 @@ corp-extractor db migrate-v2 entities.db entities-v2.db --resume  # Resume inter
 corp-extractor db backfill-scalar
 corp-extractor db backfill-scalar --skip-generate  # Only quantize existing
 
+# Post-import: generate embeddings, build USearch indexes, VACUUM (v0.9.5)
+corp-extractor db post-import
+corp-extractor db post-import --no-orgs            # People only
+
+# Build USearch HNSW index for fast ANN search (v0.9.5)
+corp-extractor db build-index
+
+# Rebuild vec0 tables with cosine distance metric (v0.9.5)
+corp-extractor db rebuild-vec
+
 # Local database management
-corp-extractor db create-lite entities.db         # Create lite version
-corp-extractor db compress entities.db            # Compress with gzip
+corp-extractor db create-lite entities-v3.db      # Create lite version (drops embeddings)
+corp-extractor db compress entities-v3.db         # Compress with gzip
 ```
 
 #### Organization Data Sources
@@ -694,7 +719,7 @@ apt install aria2    # Ubuntu/Debian
     </tr>
     <tr>
       <td><code>--dump PATH</code></td>
-      <td>Use existing dump file (.bz2 or .gz)</td>
+      <td>Use existing dump file (.bz2, .zst, or .gz)</td>
     </tr>
     <tr>
       <td><code>--people/--no-people</code></td>
@@ -718,9 +743,14 @@ apt install aria2    # Ubuntu/Debian
 **Advantages over SPARQL:**
 - No timeouts (processes locally)
 - Complete coverage (all notable people/orgs with English Wikipedia)
+- 3-thread parallel pipeline (reader → embedder → writer) for fast import
+- Multi-record person import (one per position+org, max 10 per person)
 - Captures people via occupation (P106) even if position type is generic
 - Extracts role dates from position qualifiers (P580/P582)
+- Reverse org→person mappings with date qualifiers (P169 CEO, P488 chairperson)
+- Auto-canonicalization at end of import with recency tiebreaker
 - Imports locations with hierarchical parent relationships (v0.9.4)
+- Supports `.bz2`, `.zst`/`.zstd` compressed dumps
 
 **Download location:** `~/.cache/corp-extractor/wikidata-latest-all.json.bz2`
 
@@ -745,19 +775,19 @@ Organizations discovered during people import (employers, affiliated orgs) are a
   </thead>
   <tbody>
     <tr>
-      <td><code>entities-lite.db</code></td>
-      <td>Core fields + embeddings only</td>
+      <td><code>entities-v3-lite.db</code></td>
+      <td>Core fields only (no embeddings)</td>
       <td>Default download, fast searches</td>
     </tr>
     <tr>
-      <td><code>entities.db</code></td>
-      <td>Full database with source metadata</td>
-      <td>When you need complete record data</td>
+      <td><code>entities-v3.db</code></td>
+      <td>Full database with all embedding tables</td>
+      <td>When you need to rebuild USearch indexes</td>
     </tr>
     <tr>
-      <td><code>*.db.gz</code></td>
-      <td>Gzip compressed versions</td>
-      <td>Faster downloads, auto-decompressed</td>
+      <td><code>*_usearch.bin</code></td>
+      <td>USearch HNSW indexes</td>
+      <td>Required for search (included in download)</td>
     </tr>
   </tbody>
 </table>
@@ -774,9 +804,14 @@ Organizations discovered during people import (employers, affiliated orgs) are a
   </thead>
   <tbody>
     <tr>
+      <td><code>--db-version N</code></td>
+      <td>Database schema version for filenames (global flag, e.g. <code>corp-extractor --db-version=2 db download</code>)</td>
+      <td>latest (3)</td>
+    </tr>
+    <tr>
       <td><code>--db PATH</code></td>
       <td>Database file path</td>
-      <td>~/.cache/corp-extractor/entities.db</td>
+      <td>~/.cache/corp-extractor/entities-v3.db</td>
     </tr>
     <tr>
       <td><code>--limit N</code></td>
@@ -806,4 +841,4 @@ Organizations discovered during people import (employers, affiliated orgs) are a
   </tbody>
 </table>
 
-See [COMPANY_DB.md](https://github.com/corp-o-rate/statement-extractor/blob/main/COMPANY_DB.md) for complete build and publish instructions.
+See [ENTITY_DATABASE.md](https://github.com/corp-o-rate/statement-extractor/blob/main/ENTITY_DATABASE.md) for complete build and publish instructions.

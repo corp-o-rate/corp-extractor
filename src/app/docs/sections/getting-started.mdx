@@ -77,6 +77,10 @@ for stmt in statements:
 
 **v0.9.4 features**: Database v2 schema with normalized INTEGER foreign keys and enum lookup tables. Scalar (int8) embeddings for 75% storage reduction with ~92% recall. New locations import for countries/states/cities with hierarchy. Migration commands: `db migrate-v2`, `db backfill-scalar`. New search commands: `db search-roles`, `db search-locations`.
 
+**v0.9.5 features**: USearch HNSW indexes for sub-millisecond search on 50M+ vectors. 3-thread parallel Wikidata dump import (reader/embedder/writer). Multi-record person import (one per position+org). Auto-canonicalization after dump import. New commands: `db post-import`, `db build-index`. `--hybrid` flag for text+embeddings search. `fast-import` extras (orjson, indexed_bzip2). Zstandard (.zst) dump support. New `hf_classifier` labeler plugin.
+
+**v0.9.6 features**: Database v3 — lite databases drop all embedding tables (use USearch indexes for search). `db download`/`db upload` now include USearch `.bin` files. New `db_info` metadata table with `schema_version`. Global `--db-version` CLI flag for backwards compatibility. Filenames: `entities-v3.db` / `entities-v3-lite.db`.
+
 ### Pipeline Quick Start (v0.5.0)
 
 For full entity resolution with qualification, canonicalization, labeling, and taxonomy classification:
@@ -105,10 +109,11 @@ corp-extractor pipeline "Amazon CEO Andy Jassy announced..."
 # Run specific stages only
 corp-extractor pipeline -f article.txt --stages 1-3
 
-# Process documents and URLs (v0.7.0)
+# Process documents, PDFs, and URLs (v0.7.0)
 corp-extractor document process article.txt
+corp-extractor document process report.pdf
+corp-extractor document process report.pdf --pdf-parser glm_ocr_parser
 corp-extractor document process https://example.com/article
-corp-extractor document process report.pdf --use-ocr
 ```
 
 ### Using Predicate Taxonomies
@@ -187,6 +192,6 @@ This maps synonyms like "bought", "purchased", "acquired" to a single canonical 
 - **NVIDIA GPU**: RTX 4090+ recommended for production. Uses bfloat16 precision for efficiency.
 - **Apple Silicon**: M1/M2/M3 with 16GB+ RAM. MPS acceleration auto-detected.
 - **CPU**: Functional but slower. Use for development or low-volume processing.
-- **Disk**: ~100GB for all models and entity database (10M+ organizations, 40M+ people).
+- **Disk**: ~100GB for all models and entity database (9.7M+ organizations, 63M+ people).
 
 The library runs entirely locally with no external API dependencies. Models use bfloat16 on CUDA and float32 on MPS/CPU.

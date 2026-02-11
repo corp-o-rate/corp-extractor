@@ -199,12 +199,11 @@ class EmbeddingCompanyQualifier(BaseQualifierPlugin):
         logger.debug(f"    Embedding query: '{entity.text}'")
         query_embedding = embedder.embed(entity.text)
 
-        # Search for similar companies using hybrid text + vector search
+        # Search for similar companies using embeddings-only (fast KNN MATCH path)
         logger.debug(f"    Searching database for similar companies...")
         results = database.search(
             query_embedding,
             top_k=self._top_k,
-            query_text=entity.text,  # Enable text-based pre-filtering
         )
 
         # Filter by minimum similarity

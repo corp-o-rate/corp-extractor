@@ -22,15 +22,36 @@ Resume support:
 
 import bz2
 import gzip
+import io
 import json
 import logging
 import shutil
 import subprocess
 import urllib.request
 from dataclasses import dataclass, field
+
+# Use orjson for ~3x faster JSON parsing if available
+try:
+    import orjson as _json_mod
+
+    def _json_loads(data: bytes | str) -> dict:
+        return _json_mod.loads(data)
+
+    _HAVE_ORJSON = True
+except ImportError:
+    _json_loads = json.loads  # type: ignore[assignment]
+    _HAVE_ORJSON = False
+
+# Use indexed_bzip2 for parallel decompression if available
+try:
+    import indexed_bzip2 as _ibz2
+    _HAVE_IBZ2 = True
+except ImportError:
+    _ibz2 = None  # type: ignore[assignment]
+    _HAVE_IBZ2 = False
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional
 
 from ..models import CompanyRecord, EntityType, LocationRecord, PersonRecord, PersonType, SimplifiedLocationType
 
@@ -677,6 +698,9 @@ class WikidataDumpImporter:
         self._dump_path = Path(dump_path) if dump_path else None
         # Track discovered organizations from people import
         self._discovered_orgs: dict[str, str] = {}
+        # Reverse lookup: person_qid → [(org_qid, role, start_date, end_date), ...] from org executive properties
+        # Built during org processing, used to backfill people missing known_for_org
+        self._reverse_person_orgs: dict[str, list[tuple[str, str, Optional[str], Optional[str]]]] = {}
         # Track QIDs that need label resolution (country, role)
         self._unresolved_qids: set[str] = set()
         # Label cache built during dump processing
@@ -867,33 +891,49 @@ class WikidataDumpImporter:
 
         path = Path(path)
 
-        # Select opener based on extension
-        if path.suffix == ".bz2":
-            opener = bz2.open
-        elif path.suffix == ".gz":
-            opener = gzip.open
-        else:
-            # Assume uncompressed
-            opener = open
-
         logger.info(f"Opening dump file: {path}")
         logger.info(f"File size: {path.stat().st_size / (1024**3):.1f} GB")
+        if _HAVE_ORJSON:
+            logger.info("Using orjson for fast JSON parsing")
         if start_index > 0:
             logger.info(f"Resuming from entity index {start_index:,} (skipping earlier entities)")
-        logger.info("Starting to read dump (bz2 decompression is slow, please wait)...")
 
-        with opener(path, "rt", encoding="utf-8") as f:
-            logger.info("Dump file opened successfully, reading lines...")
+        # Select opener — prefer indexed_bzip2 for parallel decompression
+        file_handle: Any = None
+        try:
+            if path.suffix == ".bz2" and _HAVE_IBZ2:
+                import os
+                ncpu = os.cpu_count() or 1
+                logger.info(f"Using indexed_bzip2 with {ncpu} cores for parallel decompression")
+                raw = _ibz2.open(str(path), parallelization=ncpu)
+                file_handle = io.TextIOWrapper(raw, encoding="utf-8")
+            elif path.suffix == ".bz2":
+                logger.info("Using stdlib bz2 (install indexed_bzip2 for ~6x faster decompression)")
+                file_handle = bz2.open(path, "rt", encoding="utf-8")
+            elif path.suffix in (".zst", ".zstd"):
+                try:
+                    import zstandard as zstd
+                    logger.info("Using zstandard decompression")
+                    fh = open(path, "rb")
+                    dctx = zstd.ZstdDecompressor()
+                    reader = dctx.stream_reader(fh)
+                    file_handle = io.TextIOWrapper(reader, encoding="utf-8")
+                except ImportError:
+                    raise ImportError("zstandard package required for .zst files: pip install zstandard")
+            elif path.suffix == ".gz":
+                file_handle = gzip.open(path, "rt", encoding="utf-8")
+            else:
+                file_handle = open(path, "r", encoding="utf-8")
+
+            logger.info("Dump file opened, reading lines...")
             line_count = 0
             entity_count = 0
             skipped_count = 0
-            # Log more frequently at start, then reduce frequency
             next_log_threshold = 10_000
 
-            for line in f:
+            for line in file_handle:
                 line_count += 1
 
-                # Log first few lines to show we're making progress
                 if line_count <= 5:
                     logger.info(f"Read line {line_count} ({len(line)} chars)")
                 elif line_count == 100:
@@ -903,11 +943,9 @@ class WikidataDumpImporter:
 
                 line = line.strip()
 
-                # Skip array brackets
                 if line in ("[", "]"):
                     continue
 
-                # Strip trailing comma
                 if line.endswith(","):
                     line = line[:-1]
 
@@ -915,24 +953,21 @@ class WikidataDumpImporter:
                     continue
 
                 try:
-                    entity = json.loads(line)
+                    entity = _json_loads(line)
                     entity_id = entity.get("id", "")
 
-                    # Always cache label for QID lookups (even when skipping)
-                    self._cache_entity_label(entity)
-
-                    # Check if we should skip this entity (resuming)
+                    # Cache label for QID lookups — only during resume skip phase
+                    # to populate cache for later entity resolution
                     if entity_count < start_index:
+                        self._cache_entity_label(entity)
                         entity_count += 1
                         skipped_count += 1
-                        # Log skipping progress with adaptive frequency
                         if skipped_count >= next_log_threshold:
                             pct = 100 * skipped_count / start_index if start_index > 0 else 0
                             logger.info(
                                 f"Skipping... {skipped_count:,}/{start_index:,} entities "
                                 f"({pct:.1f}%), label cache: {len(self._label_cache):,}"
                             )
-                            # Increase threshold: 10K -> 100K -> 1M
                             if next_log_threshold < 100_000:
                                 next_log_threshold = 100_000
                             elif next_log_threshold < 1_000_000:
@@ -941,16 +976,16 @@ class WikidataDumpImporter:
                                 next_log_threshold += 1_000_000
                         continue
 
+                    # Cache label for entities we actually process
+                    self._cache_entity_label(entity)
                     entity_count += 1
 
-                    # Log progress with adaptive frequency
                     if entity_count >= next_log_threshold:
                         logger.info(
                             f"Processed {entity_count:,} entities, "
                             f"label cache: {len(self._label_cache):,}, "
                             f"unresolved QIDs: {len(self._unresolved_qids):,}"
                         )
-                        # Increase threshold: 10K -> 100K -> 1M -> 2M -> 3M...
                         if next_log_threshold < 100_000:
                             next_log_threshold = 100_000
                         elif next_log_threshold < 1_000_000:
@@ -958,15 +993,16 @@ class WikidataDumpImporter:
                         else:
                             next_log_threshold += 1_000_000
 
-                    # Call progress callback if provided
                     if progress_callback:
                         progress_callback(entity_count, entity_id)
 
                     yield entity
 
-                except json.JSONDecodeError as e:
+                except (json.JSONDecodeError, ValueError) as e:
                     logger.debug(f"Line {line_count}: JSON decode error: {e}")
-                    continue
+        finally:
+            if file_handle is not None:
+                file_handle.close()
 
     def import_people(
         self,
@@ -1029,8 +1065,8 @@ class WikidataDumpImporter:
                 skipped += 1
                 continue
 
-            record = self._process_person_entity(entity, require_enwiki=require_enwiki)
-            if record:
+            person_records = self._process_person_entity(entity, require_enwiki=require_enwiki)
+            for record in person_records:
                 count += 1
                 if count % 10_000 == 0:
                     logger.info(f"Yielded {count:,} people records (skipped {skipped:,})...")
@@ -1040,6 +1076,8 @@ class WikidataDumpImporter:
                     progress_callback(current_entity_index, entity_id, count)
 
                 yield record
+                if limit and count >= limit:
+                    break
 
         logger.info(f"People import complete: {count:,} records (skipped {skipped:,})")
 
@@ -1214,9 +1252,13 @@ class WikidataDumpImporter:
                 if skip_people_ids and entity_id in skip_people_ids:
                     people_skipped += 1
                 else:
-                    person_record = self._process_person_entity(entity, require_enwiki=require_enwiki)
-                    if person_record:
-                        people_count += 1
+                    person_records = self._process_person_entity(entity, require_enwiki=require_enwiki)
+                    if person_records:
+                        for person_record in person_records:
+                            people_count += 1
+                            yield ("person", person_record)
+                            if people_limit and people_count >= people_limit:
+                                break
                         if people_count % 10_000 == 0:
                             logger.info(
                                 f"Progress: {people_count:,} people, {orgs_count:,} orgs "
@@ -1224,7 +1266,6 @@ class WikidataDumpImporter:
                             )
                         if progress_callback:
                             progress_callback(current_entity_index, entity_id, people_count, orgs_count)
-                        yield ("person", person_record)
                         continue  # Entity was a person, don't check for org
 
             # Try to process as organization (if importing orgs and not at limit)
@@ -1254,33 +1295,36 @@ class WikidataDumpImporter:
         self,
         entity: dict,
         require_enwiki: bool = False,
-    ) -> Optional[PersonRecord]:
+    ) -> list[PersonRecord]:
         """
-        Process a single entity, return PersonRecord if it's a human.
+        Process a single entity, return PersonRecord(s) if it's a human.
+
+        Returns multiple records when a person has multiple positions with
+        different orgs (e.g. CEO of company A and board member of company B).
 
         Args:
             entity: Parsed Wikidata entity dictionary
             require_enwiki: If True, only include people with English Wikipedia articles
 
         Returns:
-            PersonRecord if entity qualifies, None otherwise
+            List of PersonRecords (empty if entity doesn't qualify)
         """
         # Must be an item (not property)
         if entity.get("type") != "item":
-            return None
+            return []
 
         # Must be human (P31 contains Q5)
         if not self._is_human(entity):
-            return None
+            return []
 
         # Optionally require English Wikipedia article
         if require_enwiki:
             sitelinks = entity.get("sitelinks", {})
             if "enwiki" not in sitelinks:
-                return None
+                return []
 
-        # Extract person data
-        return self._extract_person_data(entity)
+        # Extract person records (one per position with org)
+        return self._extract_person_records(entity)
 
     def _process_org_entity(
         self,
@@ -1632,18 +1676,22 @@ class WikidataDumpImporter:
 
         return "", "", "", None, None, {}
 
-    def _extract_person_data(self, entity: dict) -> Optional[PersonRecord]:
+    def _extract_person_records(self, entity: dict) -> list[PersonRecord]:
         """
-        Extract PersonRecord from entity dict.
+        Extract one or more PersonRecords from entity dict.
 
-        Derives type/role/org from claims.
+        Creates a separate record for each position that has an org/context,
+        so a CEO of 5 companies gets 5 entries linked by canonicalization.
+        Falls back to a single record when no positions have orgs.
 
         Args:
             entity: Parsed Wikidata entity dictionary
 
         Returns:
-            PersonRecord or None if essential data is missing
+            List of PersonRecords (empty if essential data is missing)
         """
+        MAX_RECORDS_PER_PERSON = 10
+
         qid = entity.get("id", "")
         labels = entity.get("labels", {})
         # Try English label first, fall back to any available label
@@ -1656,7 +1704,7 @@ class WikidataDumpImporter:
                     break
 
         if not label or not qid:
-            return None
+            return []
 
         claims = entity.get("claims", {})
 
@@ -1668,24 +1716,10 @@ class WikidataDumpImporter:
         # Classify person type from positions + occupations
         person_type = self._classify_person_type(positions, occupations)
 
-        # Get best role/org/dates from positions
-        role_qid, _, org_qid, start_date, end_date, extra_context = self._get_best_role_org(positions)
-
-        # Fallback: if no org from positions, check top-level P108 (employer)
-        if not org_qid:
-            employers = self._get_claim_values(entity, "P108")
-            if employers:
-                org_qid = employers[0]
-                logger.debug(f"Using top-level P108 employer for {qid}: {org_qid}")
-
         # Get country (P27 - country of citizenship)
         countries = self._get_claim_values(entity, "P27")
         country_qid = countries[0] if countries else ""
-
-        # Resolve QIDs to labels using the cache (or track for later resolution)
         country_label = self._resolve_qid(country_qid) if country_qid else ""
-        role_label = self._resolve_qid(role_qid) if role_qid else ""
-        org_label = self._resolve_qid(org_qid) if org_qid else ""
 
         # Get birth and death dates (P569, P570)
         birth_date = self._get_time_claim(claims, "P569")
@@ -1695,41 +1729,126 @@ class WikidataDumpImporter:
         descriptions = entity.get("descriptions", {})
         description = descriptions.get("en", {}).get("value", "")
 
-        # Track discovered organization
-        if org_qid:
-            self._discovered_orgs[org_qid] = org_label
-
-        # Build record with all position metadata
-        record_data = {
+        # Shared record data (position-specific fields added per record below)
+        base_record_data = {
             "wikidata_id": qid,
             "label": label,
             "description": description,
             "positions": [p["position_qid"] for p in positions],
             "occupations": occupations,
-            "org_qid": org_qid,
             "country_qid": country_qid,
-            "role_qid": role_qid,
             "birth_date": birth_date,
             "death_date": death_date,
         }
-        # Add parliamentary context if present
-        if extra_context:
-            record_data.update(extra_context)
 
-        return PersonRecord(
-            name=label,
-            source="wikidata",
-            source_id=qid,
-            country=country_label,
-            person_type=person_type,
-            known_for_role=role_label,
-            known_for_org=org_label,
-            from_date=start_date,
-            to_date=end_date,
-            birth_date=birth_date,
-            death_date=death_date,
-            record=record_data,
-        )
+        def make_record(
+            role_qid: str, org_qid: str, start_date: Optional[str], end_date: Optional[str],
+            extra_context: Optional[dict] = None,
+        ) -> PersonRecord:
+            role_label = self._resolve_qid(role_qid) if role_qid else ""
+            org_label = self._resolve_qid(org_qid) if org_qid else ""
+
+            # Track discovered org
+            if org_qid:
+                self._discovered_orgs[org_qid] = org_label
+
+            record_data = {
+                **base_record_data,
+                "org_qid": org_qid,
+                "role_qid": role_qid,
+            }
+            if extra_context:
+                record_data.update(extra_context)
+
+            return PersonRecord(
+                name=label,
+                source="wikidata",
+                source_id=qid,
+                country=country_label,
+                person_type=person_type,
+                known_for_role=role_label,
+                known_for_org=org_label,
+                from_date=start_date,
+                to_date=end_date,
+                birth_date=birth_date,
+                death_date=death_date,
+                record=record_data,
+            )
+
+        # --- Multi-record path: one record per position with an org ---
+        records: list[PersonRecord] = []
+        seen_role_org: set[tuple[str, str]] = set()
+
+        for pos in positions:
+            org_qid = self._get_org_or_context(pos)
+            if not org_qid:
+                continue
+            role_qid = pos["position_qid"]
+            key = (role_qid, org_qid)
+            if key in seen_role_org:
+                continue
+            seen_role_org.add(key)
+
+            extra_context = {
+                k: v for k, v in {
+                    "electoral_district": pos.get("electoral_district"),
+                    "parliamentary_term": pos.get("parliamentary_term"),
+                    "parliamentary_group": pos.get("parliamentary_group"),
+                    "elected_in": pos.get("elected_in"),
+                }.items() if v
+            }
+            records.append(make_record(
+                role_qid, org_qid, pos.get("start_date"), pos.get("end_date"), extra_context,
+            ))
+            if len(records) >= MAX_RECORDS_PER_PERSON:
+                break
+
+        if records:
+            logger.debug(f"{qid} ({label}): {len(records)} position records")
+            return records
+
+        # --- Fallback: single record (no positions had orgs) ---
+        # Use _get_best_role_org for the single best position
+        role_qid, _, org_qid, start_date, end_date, extra_context = self._get_best_role_org(positions)
+
+        # Fallback: P108 employer
+        if not org_qid:
+            employers = self._get_claim_values(entity, "P108")
+            if employers:
+                org_qid = employers[0]
+                logger.debug(f"Using top-level P108 employer for {qid}: {org_qid}")
+
+        # Fallback: reverse lookup from org entities (P169 CEO, P488 chair, etc.)
+        if not org_qid and qid in self._reverse_person_orgs:
+            # Use first reverse mapping for the single-record fallback
+            rev_org_qid, reverse_role, rev_start, rev_end = self._reverse_person_orgs[qid][0]
+            org_qid = rev_org_qid
+            if not start_date:
+                start_date = rev_start
+            if not end_date:
+                end_date = rev_end
+            logger.debug(f"Using reverse org lookup for {qid}: {org_qid} ({reverse_role})")
+
+        # Fallback chain: type-specific properties
+        if not org_qid:
+            fallback_props = [
+                ("P1830", "owner-of"),
+                ("P54", "sports-team"),
+                ("P102", "political-party"),
+                ("P241", "military-branch"),
+                ("P264", "record-label"),
+                ("P1416", "affiliation"),
+                ("P463", "member-of"),
+                ("P69", "educated-at"),
+            ]
+            for prop, prop_label in fallback_props:
+                values = self._get_claim_values(entity, prop)
+                if values:
+                    org_qid = values[0]
+                    logger.debug(f"Using {prop} ({prop_label}) for {qid}: {org_qid}")
+                    break
+
+        return [make_record(role_qid, org_qid, start_date, end_date, extra_context)]
 
     def _extract_org_data(
         self,
@@ -1777,6 +1896,33 @@ class WikidataDumpImporter:
 
         # Get dissolution date (P576)
         dissolution = self._get_time_claim(claims, "P576")
+
+        # Extract executive/leadership properties → reverse person lookup
+        # These properties on the org point to people (person_qid)
+        # Iterate claims directly to extract P580/P582 date qualifiers per claim
+        executive_props = [
+            ("P169", "chief executive officer"),
+            ("P488", "chairperson"),
+            ("P112", "founded by"),
+            ("P1037", "director/manager"),
+            ("P3320", "board member"),
+        ]
+        for prop, role_desc in executive_props:
+            for claim in claims.get(prop, []):
+                mainsnak = claim.get("mainsnak", {})
+                person_qid = mainsnak.get("datavalue", {}).get("value", {}).get("id")
+                if not person_qid:
+                    continue
+                qualifiers = claim.get("qualifiers", {})
+                start_date = self._get_time_qualifier(qualifiers, "P580")
+                end_date = self._get_time_qualifier(qualifiers, "P582")
+                self._reverse_person_orgs.setdefault(person_qid, []).append(
+                    (qid, role_desc, start_date, end_date)
+                )
+                logger.debug(
+                    f"Reverse mapping: {person_qid} → {qid} ({label}) as {role_desc} "
+                    f"({start_date or '?'} – {end_date or '?'})"
+                )
 
         return CompanyRecord(
             name=label,
@@ -2072,6 +2218,19 @@ class WikidataDumpImporter:
         """Clear the discovered organizations cache."""
         self._discovered_orgs.clear()
 
+    def get_reverse_person_orgs(self) -> dict[str, list[tuple[str, str, Optional[str], Optional[str]]]]:
+        """
+        Get the reverse person→org mappings built during org import.
+
+        Maps person_qid → [(org_qid, role_description, start_date, end_date), ...] from org
+        executive properties (P169 CEO, P488 chairperson, P112 founded by, P1037 director,
+        P3320 board member).
+
+        Use this after import to backfill people whose org entity appeared after their
+        person entity in the dump (since the dump is processed in QID order).
+        """
+        return self._reverse_person_orgs
+
     def get_unresolved_qids(self) -> set[str]:
         """Get QIDs that need label resolution."""
         return self._unresolved_qids.copy()
@@ -2100,7 +2259,9 @@ class WikidataDumpImporter:
         Returns:
             Dict of new QID -> label mappings
         """
-        return {qid: label for qid, label in self._label_cache.items() if qid not in known_qids}
+        # Snapshot to avoid RuntimeError from concurrent reader thread mutations
+        items = list(self._label_cache.items())
+        return {qid: label for qid, label in items if qid not in known_qids}
 
     def _cache_entity_label(self, entity: dict) -> None:
         """
@@ -2120,29 +2281,19 @@ class WikidataDumpImporter:
 
     def _resolve_qid(self, qid: str) -> str:
         """
-        Resolve a QID to a label, using cache or SPARQL lookup.
+        Resolve a QID to a label using the in-memory cache.
 
-        Returns the label if found/resolved, otherwise returns the QID.
+        Returns the label if cached, otherwise returns the raw QID and tracks it
+        for batch resolution after import completes. No network calls during import.
         """
         if not qid or not qid.startswith("Q"):
             return qid
 
         if qid in self._label_cache:
-            label = self._label_cache[qid]
-            logger.debug(f"Resolved QID (cache): {qid} -> {label}")
-            return label
+            return self._label_cache[qid]
 
-        # Not in cache - resolve via SPARQL immediately
-        label = self._resolve_single_qid_sparql(qid)
-        if label:
-            logger.info(f"Resolved QID (SPARQL): {qid} -> {label}")
-            self._label_cache[qid] = label
-            return label
-
-        # Track unresolved
-        if qid not in self._unresolved_qids:
-            logger.debug(f"Unresolved QID: {qid}")
-            self._unresolved_qids.add(qid)
+        # Track for post-import batch SPARQL resolution — no blocking network calls
+        self._unresolved_qids.add(qid)
         return qid
 
     def _resolve_single_qid_sparql(self, qid: str) -> Optional[str]:

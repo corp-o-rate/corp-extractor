@@ -4,7 +4,7 @@
 
 The entity database provides fast lookup and qualification of organizations, people, roles, and locations using vector similarity search. It stores records from authoritative sources with 768-dimensional embeddings for semantic matching.
 
-<span className="text-xs font-medium bg-green-100 dark:bg-green-900 text-green-800 dark:text-green-200 px-2 py-0.5 rounded">UPDATED in v0.9.4</span>
+<span className="text-xs font-medium bg-green-100 dark:bg-green-900 text-green-800 dark:text-green-200 px-2 py-0.5 rounded">UPDATED in v0.9.6</span>
 
 ---
 
@@ -45,11 +45,14 @@ The database is automatically used by the pipeline's qualification stage (Stage 
 The fastest way to get started is downloading from HuggingFace:
 
 ```bash
-# Download lite version (default, smaller, faster)
+# Download lite version + USearch indexes (default)
 corp-extractor db download
 
-# Download full version (includes complete source metadata)
+# Download full version + USearch indexes
 corp-extractor db download --full
+
+# Download older v2 database files
+corp-extractor --db-version=2 db download
 ```
 
 **Database variants:**
@@ -58,25 +61,26 @@ corp-extractor db download --full
   <thead>
     <tr>
       <th>File</th>
-      <th>Size</th>
       <th>Contents</th>
     </tr>
   </thead>
   <tbody>
     <tr>
-      <td><code>entities-lite.db</code></td>
-      <td>30.1 GB</td>
-      <td>Core fields + int8 embeddings only</td>
+      <td><code>entities-v3-lite.db</code></td>
+      <td>Core fields only (no embedding tables)</td>
     </tr>
     <tr>
-      <td><code>entities.db</code></td>
-      <td>32.2 GB</td>
-      <td>Full records with source metadata</td>
+      <td><code>entities-v3.db</code></td>
+      <td>Full records with all embedding tables</td>
+    </tr>
+    <tr>
+      <td><code>*_usearch.bin</code></td>
+      <td>USearch HNSW indexes for search</td>
     </tr>
   </tbody>
 </table>
 
-**Storage location:** `~/.cache/corp-extractor/entities-v2.db` (v0.9.4+)
+**Storage location:** `~/.cache/corp-extractor/entities-v3.db`
 
 **HuggingFace repo:** [Corp-o-Rate-Community/entity-references](https://huggingface.co/datasets/Corp-o-Rate-Community/entity-references)
 
@@ -98,7 +102,7 @@ ctx = pipeline.process("Microsoft CEO Satya Nadella announced...")
 
 <span id="database-schema" />
 
-The database uses SQLite with the [sqlite-vec](https://github.com/asg017/sqlite-vec) extension for vector similarity search.
+The database uses SQLite with [sqlite-vec](https://github.com/asg017/sqlite-vec) for embedding storage and [USearch](https://github.com/unum-cloud/usearch) HNSW indexes for sub-millisecond approximate nearest neighbor search.
 
 #### Schema v2 (Normalized)
 
@@ -132,13 +136,17 @@ CREATE TABLE organizations (
     UNIQUE(source_identifier, source_id)
 );
 
--- Both float32 and int8 embeddings supported (v0.9.4)
+-- Embedding tables (full database only — dropped in lite v3)
 CREATE VIRTUAL TABLE organization_embeddings USING vec0(
     org_id INTEGER PRIMARY KEY, embedding float[768]
 );
 CREATE VIRTUAL TABLE organization_embeddings_scalar USING vec0(
     org_id INTEGER PRIMARY KEY, embedding int8[768]
 );
+
+-- Metadata table (v0.9.6)
+CREATE TABLE db_info (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+-- Contains: schema_version = 3
 ```
 
 #### People Table
@@ -164,6 +172,7 @@ CREATE TABLE people (
     UNIQUE(source_identifier, source_id, known_for_role_id, known_for_org_id)
 );
 
+-- Embedding tables (full database only — dropped in lite v3)
 CREATE VIRTUAL TABLE person_embeddings USING vec0(
     person_id INTEGER PRIMARY KEY, embedding float[768]
 );
@@ -414,7 +423,7 @@ CREATE TABLE locations (
   </tbody>
 </table>
 
-**Total: 9.6M+ organizations**
+**Total: 9.7M+ organizations**
 
 #### People
 
@@ -436,14 +445,14 @@ CREATE TABLE locations (
     </tr>
     <tr>
       <td>Wikidata</td>
-      <td>13.4M</td>
+      <td>36M</td>
       <td>QID</td>
       <td>Notable people worldwide</td>
     </tr>
   </tbody>
 </table>
 
-**Total: 41M+ people**
+**Total: 63M+ people**
 
 #### Other Tables
 
@@ -458,7 +467,7 @@ CREATE TABLE locations (
   <tbody>
     <tr>
       <td>Roles</td>
-      <td>94K</td>
+      <td>139K</td>
       <td>Job titles with Wikidata QIDs</td>
     </tr>
     <tr>
@@ -482,7 +491,7 @@ from statement_extractor.database import OrganizationDatabase
 
 db = OrganizationDatabase()
 
-# Search by name (hybrid: text + embedding)
+# Search by name (uses USearch HNSW index for fast ANN search)
 matches = db.search_by_name("Microsoft Corporation", top_k=5)
 for match in matches:
     print(f"{match.company.name} ({match.company.source}:{match.company.source_id})")
@@ -618,6 +627,13 @@ brew install aria2   # macOS
 apt install aria2    # Ubuntu/Debian
 ```
 
+**Fast import extras** (optional, ~3x JSON parsing + 6x decompression):
+```bash
+pip install "corp-extractor[fast-import]"  # Adds orjson + indexed_bzip2
+```
+
+The dump import uses a 3-thread parallel pipeline (reader → embedder → writer) for overlapping I/O, CPU encoding, and disk writes. Each person now yields multiple records (one per position+org combination), and canonicalization runs automatically at the end.
+
 #### Full Build Process
 
 ```bash
@@ -628,11 +644,11 @@ corp-extractor db import-companies-house --download
 corp-extractor db import-wikidata --limit 100000
 corp-extractor db import-wikidata-dump --download --people --no-orgs --limit 100000
 
-# 2. Link equivalent records
-corp-extractor db canonicalize
+# 2. Post-import: generate embeddings, build USearch indexes, VACUUM
+corp-extractor db post-import
 
-# 3. Generate scalar embeddings (75% storage reduction)
-corp-extractor db backfill-scalar
+# 3. Link equivalent records
+corp-extractor db canonicalize
 
 # 4. Check status
 corp-extractor db status
@@ -783,7 +799,7 @@ embedding = embedder.embed("Apple Inc")  # Returns 768-dim numpy array
 
 **Database not found:**
 ```
-Error: Database not found at ~/.cache/corp-extractor/entities.db
+Error: Database not found at ~/.cache/corp-extractor/entities-v3.db
 ```
 Run `corp-extractor db download` to fetch the pre-built database.
 
