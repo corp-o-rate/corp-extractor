@@ -43,9 +43,6 @@ MAX_CACHE_SIZE_BYTES = int(os.environ.get("MAX_CACHE_SIZE_BYTES", 10 * 1024 * 10
 DEFAULT_NUM_BEAMS = int(os.environ.get("NUM_BEAMS", 4))
 DEFAULT_MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", 2048))
 
-# Output format: "json" (default) or "xml" (legacy)
-OUTPUT_FORMAT = os.environ.get("OUTPUT_FORMAT", "json")
-
 # Concurrency settings
 MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", 4))
 
@@ -150,12 +147,13 @@ def load_extractor():
 
 def extract_sync(
     text: str,
-    output_format: str,
     use_canonical_predicates: bool,
     similarity_threshold: float,
-) -> str:
+) -> dict:
     """
     Run extraction using the corp-extractor library.
+
+    Returns ExtractionResult as a dict (model_dump).
     """
     global extractor
 
@@ -179,11 +177,8 @@ def extract_sync(
     if use_canonical_predicates:
         options.predicate_taxonomy = PredicateTaxonomy(predicates=CANONICAL_PREDICATES)
 
-    # Use the library's extraction methods
-    if output_format == "xml":
-        return extractor.extract_as_xml(text, options)
-    else:
-        return extractor.extract_as_json(text, options)
+    result = extractor.extract(text, options)
+    return result.model_dump()
 
 
 def process_url_sync(
@@ -232,26 +227,9 @@ def process_url_sync(
     finally:
         loop.close()
 
-    # Convert results to serializable format using as_dict() which includes
-    # subject/object with name, fqn, qualifiers, plus labels and taxonomy
-    statements = [stmt.as_dict() for stmt in ctx.labeled_statements]
-
-    result = {
-        "statements": statements,
-        "metadata": {
-            "title": ctx.document.metadata.title if ctx.document and ctx.document.metadata else None,
-            "url": url,
-            "chunk_count": ctx.chunk_count,
-            "statement_count": ctx.statement_count,
-            "duplicates_removed": ctx.duplicates_removed,
-        },
-    }
-
-    # Add summary if available
-    if ctx.summary:
-        result["summary"] = ctx.summary
-
-    return result
+    # Return standardized DocumentContext model_dump format
+    # Exclude chunk_contexts (contains PipelineContexts with non-serializable fields)
+    return ctx.model_dump(mode='json', exclude={'chunk_contexts'})
 
 
 async def handler(job):
@@ -299,28 +277,21 @@ async def handler(job):
         logger.error("No text or URL provided")
         return {"error": "No text or URL provided. Send {\"input\": {\"text\": \"...\"}} or {\"input\": {\"url\": \"...\"}}"}
 
-    # Get output format
-    output_format = job_input.get("format", OUTPUT_FORMAT).lower()
-    if output_format not in ("json", "xml"):
-        output_format = "json"
-
     # Get options
     use_canonical_predicates = job_input.get("useCanonicalPredicates", False)
     similarity_threshold = float(job_input.get("similarityThreshold", 0.5))
     similarity_threshold = max(0.0, min(1.0, similarity_threshold))
 
-    logger.info(f"Processing text of length: {len(text)}, format: {output_format}")
+    logger.info(f"Processing text of length: {len(text)}")
 
     # Check cache
-    cache_key = get_cache_key(text, output_format, use_canonical_predicates, similarity_threshold)
+    cache_key = get_cache_key(text, "json", use_canonical_predicates, similarity_threshold)
     if cache_key in result_cache:
         result_cache.move_to_end(cache_key)
         logger.info(f"Cache hit: {cache_key[:16]}...")
-        result = result_cache[cache_key]
-        if output_format == "json":
-            return {"output": json.loads(result), "format": "json", "cached": True}
-        else:
-            return {"output": result, "format": "xml", "cached": True}
+        cached_result = json.loads(result_cache[cache_key])
+        cached_result["cached"] = True
+        return cached_result
 
     try:
         start_time = time.time()
@@ -331,21 +302,17 @@ async def handler(job):
                 None,
                 extract_sync,
                 text,
-                output_format,
                 use_canonical_predicates,
                 similarity_threshold,
             )
 
         elapsed = time.time() - start_time
-        logger.info(f"Extraction complete in {elapsed:.2f}s, output length: {len(result)}")
+        logger.info(f"Extraction complete in {elapsed:.2f}s")
 
-        # Cache the result
-        cache_result(cache_key, result)
+        # Cache the result (as JSON string)
+        cache_result(cache_key, json.dumps(result))
 
-        if output_format == "json":
-            return {"output": json.loads(result), "format": "json"}
-        else:
-            return {"output": result, "format": "xml"}
+        return result
 
     except Exception as e:
         logger.exception("Error during extraction")

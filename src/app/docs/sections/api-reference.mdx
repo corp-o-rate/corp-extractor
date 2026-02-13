@@ -18,22 +18,22 @@ The library provides convenience functions for quick extraction without managing
   </thead>
   <tbody>
     <tr>
-      <td><code>extract_statements(text, options?)</code></td>
+      <td><code>extract_statements(text, options?, server_url?)</code></td>
       <td><code>ExtractionResult</code></td>
-      <td>Main extraction function. Returns structured statements with confidence scores.</td>
+      <td>Main extraction function. Returns structured statements with confidence scores. Pass <code>server_url</code> to delegate to a running server.</td>
     </tr>
     <tr>
-      <td><code>extract_statements_as_json(text, options?, indent?)</code></td>
+      <td><code>extract_statements_as_json(text, options?, indent?, server_url?)</code></td>
       <td><code>str</code></td>
       <td>Returns extraction result as a JSON string.</td>
     </tr>
     <tr>
-      <td><code>extract_statements_as_xml(text, options?)</code></td>
+      <td><code>extract_statements_as_xml(text, options?, server_url?)</code></td>
       <td><code>str</code></td>
       <td>Returns raw XML output from the model.</td>
     </tr>
     <tr>
-      <td><code>extract_statements_as_dict(text, options?)</code></td>
+      <td><code>extract_statements_as_dict(text, options?, server_url?)</code></td>
       <td><code>dict</code></td>
       <td>Returns extraction result as a Python dictionary.</td>
     </tr>
@@ -46,6 +46,7 @@ The library provides convenience functions for quick extraction without managing
 def extract_statements(
     text: str,
     options: Optional[ExtractionOptions] = None,
+    server_url: Optional[str] = None,
     **kwargs
 ) -> ExtractionResult:
     """
@@ -54,6 +55,9 @@ def extract_statements(
     Args:
         text: Input text to extract statements from
         options: Extraction options (or pass individual options as kwargs)
+        server_url: URL of a running corp-extractor server to delegate to
+                    (e.g. "http://localhost:8111"). When provided, no local
+                    models are loaded.
         **kwargs: Individual option overrides (num_beams, diversity_penalty, etc.)
 
     Returns:
@@ -477,12 +481,15 @@ The main orchestrator class that runs all pipeline stages.
 from statement_extractor.pipeline import ExtractionPipeline, PipelineConfig
 
 class ExtractionPipeline:
-    def __init__(self, config: Optional[PipelineConfig] = None):
+    def __init__(self, config: Optional[PipelineConfig] = None, server_url: Optional[str] = None):
         """
         Initialize the extraction pipeline.
 
         Args:
             config: Pipeline configuration (default: all stages enabled)
+            server_url: URL of a running corp-extractor server to delegate to.
+                        When provided, process() sends HTTP requests instead
+                        of loading models locally.
         """
 
     def process(self, text: str, metadata: Optional[dict] = None) -> PipelineContext:
@@ -865,4 +872,107 @@ class TaxonomySchema(BaseModel):
     description: str = ""
     scope: str = "statement"
     label_descriptions: Optional[dict[str, str]] = None  # Descriptions for labels
+```
+
+---
+
+### Server API
+
+<span id="server-api" />
+
+<span className="text-xs font-medium bg-green-100 dark:bg-green-900 text-green-800 dark:text-green-200 px-2 py-0.5 rounded">NEW in v0.9.7</span>
+
+The `corp-extractor serve` command starts a FastAPI server that keeps all models warm in memory. All endpoints return standardized Pydantic `model_dump()` JSON responses. The server can be called from the CLI (`--server` flag), the Python API (`server_url` parameter), or any HTTP client.
+
+#### `GET /` — Health Check
+
+Returns server status, device info, loaded models, and registered plugins.
+
+```bash
+curl http://localhost:8111/
+```
+
+Response:
+```json
+{
+  "status": "ok",
+  "device": "cuda:0",
+  "cuda_available": true,
+  "mps_available": false,
+  "models_loaded": {"extractor": true, "pipeline": true},
+  "plugins": {
+    "splitters": ["t5_gemma_splitter"],
+    "extractors": ["gliner2_extractor"],
+    "qualifiers": ["person_qualifier", "embedding_company_qualifier"],
+    "labelers": ["sentiment_labeler", "confidence_labeler", "relation_type_labeler"],
+    "taxonomy": ["embedding_taxonomy_classifier"]
+  }
+}
+```
+
+---
+
+#### `POST /pipeline` — Full Pipeline
+
+Runs the full extraction pipeline. Request body:
+
+```python
+class PipelineRequest(BaseModel):
+    text: str                              # Input text
+    config: dict[str, Any] = {}            # Pipeline configuration
+```
+
+Config supports: `enabled_stages` (str like `"1-3"` or list), `disabled_plugins` (list), `enabled_plugins` (list), `extractor_options`, `splitter_options`, `qualifier_options`, `labeler_options`, `taxonomy_options`.
+
+Response: `PipelineContext.model_dump()` JSON.
+
+```bash
+curl -X POST http://localhost:8111/pipeline \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Apple CEO Tim Cook announced a new iPhone.", "config": {"enabled_stages": "1-3"}}'
+```
+
+---
+
+#### `POST /split` — Stage 1 Only
+
+Runs T5-Gemma extraction only. Request body:
+
+```python
+class SplitRequest(BaseModel):
+    text: str                              # Input text
+    options: dict[str, Any] = {}           # ExtractionOptions fields
+```
+
+Options supports: `num_beams`, `diversity_penalty`, `max_new_tokens`, `deduplicate`, etc.
+
+Response: `ExtractionResult.model_dump()` JSON.
+
+```bash
+curl -X POST http://localhost:8111/split \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Apple announced a new iPhone.", "options": {"num_beams": 6}}'
+```
+
+---
+
+#### `POST /document` — Document Pipeline
+
+Runs the document pipeline for text input. Request body:
+
+```python
+class DocumentRequest(BaseModel):
+    text: str                              # Document text
+    title: Optional[str] = None            # Document title
+    stages: str = "1-6"                    # Pipeline stages
+    max_tokens: int = 1000                 # Target tokens per chunk
+    overlap: int = 100                     # Token overlap between chunks
+    no_summary: bool = False               # Skip summarization
+    no_dedup: bool = False                 # Skip cross-chunk deduplication
+```
+
+```bash
+curl -X POST http://localhost:8111/document \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Long document text...", "title": "Annual Report", "stages": "1-3"}'
 ```

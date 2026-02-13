@@ -879,6 +879,29 @@ class StatementExtractor:
         return len(re.findall(r'<stmt>', xml_output))
 
 
+def _result_to_xml(result: ExtractionResult) -> str:
+    """Convert an ExtractionResult to XML format."""
+    import xml.etree.ElementTree as ET
+
+    root = ET.Element("statements")
+    for stmt in result.statements:
+        stmt_el = ET.SubElement(root, "stmt")
+        subj = ET.SubElement(stmt_el, "subject")
+        subj.text = stmt.subject.text
+        if stmt.subject.type.value != "UNKNOWN":
+            subj.set("type", stmt.subject.type.value)
+        obj = ET.SubElement(stmt_el, "object")
+        obj.text = stmt.object.text
+        if stmt.object.type.value != "UNKNOWN":
+            obj.set("type", stmt.object.type.value)
+        pred = ET.SubElement(stmt_el, "predicate")
+        pred.text = stmt.predicate
+        if stmt.source_text:
+            text_el = ET.SubElement(stmt_el, "text")
+            text_el.text = stmt.source_text
+    return ET.tostring(root, encoding="unicode")
+
+
 # Convenience functions for simple usage
 
 _default_extractor: Optional[StatementExtractor] = None
@@ -895,6 +918,7 @@ def _get_default_extractor() -> StatementExtractor:
 def extract_statements(
     text: str,
     options: Optional[ExtractionOptions] = None,
+    server_url: Optional[str] = None,
     **kwargs,
 ) -> ExtractionResult:
     """
@@ -909,6 +933,7 @@ def extract_statements(
     Args:
         text: Input text to extract statements from
         options: Extraction options (or pass individual options as kwargs)
+        server_url: If provided, delegate to a running corp-extractor server
         **kwargs: Individual option overrides (num_beams, diversity_penalty, etc.)
 
     Returns:
@@ -918,7 +943,14 @@ def extract_statements(
         >>> result = extract_statements("Apple announced a new product.")
         >>> for stmt in result:
         ...     print(f"{stmt.subject.text} -> {stmt.predicate} -> {stmt.object.text}")
+
+        >>> # Delegate to a running server
+        >>> result = extract_statements("text", server_url="http://localhost:8111")
     """
+    if server_url:
+        from .client import server_split
+        opts = options or (ExtractionOptions(**kwargs) if kwargs else None)
+        return server_split(server_url, text, opts)
     if options is None and kwargs:
         options = ExtractionOptions(**kwargs)
     return _get_default_extractor().extract(text, options)
@@ -927,6 +959,7 @@ def extract_statements(
 def extract_statements_as_xml(
     text: str,
     options: Optional[ExtractionOptions] = None,
+    server_url: Optional[str] = None,
     **kwargs,
 ) -> str:
     """
@@ -935,11 +968,15 @@ def extract_statements_as_xml(
     Args:
         text: Input text to extract statements from
         options: Extraction options
+        server_url: If provided, delegate to server then convert to XML
         **kwargs: Individual option overrides
 
     Returns:
         XML string with <statements> containing <stmt> elements
     """
+    if server_url:
+        result = extract_statements(text, options, server_url=server_url, **kwargs)
+        return _result_to_xml(result)
     if options is None and kwargs:
         options = ExtractionOptions(**kwargs)
     return _get_default_extractor().extract_as_xml(text, options)
@@ -949,6 +986,7 @@ def extract_statements_as_json(
     text: str,
     options: Optional[ExtractionOptions] = None,
     indent: Optional[int] = 2,
+    server_url: Optional[str] = None,
     **kwargs,
 ) -> str:
     """
@@ -958,11 +996,15 @@ def extract_statements_as_json(
         text: Input text to extract statements from
         options: Extraction options
         indent: JSON indentation (None for compact)
+        server_url: If provided, delegate to server
         **kwargs: Individual option overrides
 
     Returns:
         JSON string representation of the extraction result
     """
+    if server_url:
+        result = extract_statements(text, options, server_url=server_url, **kwargs)
+        return result.model_dump_json(indent=indent)
     if options is None and kwargs:
         options = ExtractionOptions(**kwargs)
     return _get_default_extractor().extract_as_json(text, options, indent)
@@ -971,6 +1013,7 @@ def extract_statements_as_json(
 def extract_statements_as_dict(
     text: str,
     options: Optional[ExtractionOptions] = None,
+    server_url: Optional[str] = None,
     **kwargs,
 ) -> dict:
     """
@@ -979,11 +1022,15 @@ def extract_statements_as_dict(
     Args:
         text: Input text to extract statements from
         options: Extraction options
+        server_url: If provided, delegate to server
         **kwargs: Individual option overrides
 
     Returns:
         Dictionary representation of the extraction result
     """
+    if server_url:
+        result = extract_statements(text, options, server_url=server_url, **kwargs)
+        return result.model_dump()
     if options is None and kwargs:
         options = ExtractionOptions(**kwargs)
     return _get_default_extractor().extract_as_dict(text, options)

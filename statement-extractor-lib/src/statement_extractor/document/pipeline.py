@@ -72,20 +72,24 @@ class DocumentPipeline:
     def __init__(
         self,
         config: Optional[DocumentPipelineConfig] = None,
+        server_url: Optional[str] = None,
     ):
         """
         Initialize the document pipeline.
 
         Args:
             config: Document pipeline configuration
+            server_url: If provided, delegate processing to a running server
         """
         self.config = config or DocumentPipelineConfig()
+        self._server_url = server_url
 
-        # Initialize components
-        self._chunker = DocumentChunker(self.config.chunking)
-        self._deduplicator = StatementDeduplicator()
-        self._summarizer = DocumentSummarizer() if self.config.generate_summary else None
-        self._pipeline = ExtractionPipeline(self.config.pipeline_config)
+        if not server_url:
+            # Only initialize local components when processing locally
+            self._chunker = DocumentChunker(self.config.chunking)
+            self._deduplicator = StatementDeduplicator()
+            self._summarizer = DocumentSummarizer() if self.config.generate_summary else None
+            self._pipeline = ExtractionPipeline(self.config.pipeline_config)
 
     def process(self, document: Document) -> DocumentContext:
         """
@@ -97,6 +101,18 @@ class DocumentPipeline:
         Returns:
             DocumentContext with all extraction results
         """
+        if self._server_url:
+            from ..client import server_document
+            kwargs = {
+                "title": document.metadata.title,
+                "stages": ",".join(str(s) for s in sorted(self.config.pipeline_config.enabled_stages)) if self.config.pipeline_config else "1-6",
+                "max_tokens": self.config.chunking.target_tokens,
+                "overlap": self.config.chunking.overlap_tokens,
+                "no_summary": not self.config.generate_summary,
+                "no_dedup": not self.config.deduplicate_across_chunks,
+            }
+            return server_document(self._server_url, document.full_text, **kwargs)
+
         logger.info(f"Starting document pipeline: {document.document_id}")
         start_time = time.time()
 

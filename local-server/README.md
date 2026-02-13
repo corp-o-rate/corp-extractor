@@ -101,12 +101,20 @@ curl -X POST http://localhost:8000/extract \
   -d '{"text": "Apple Inc. announced a commitment to carbon neutrality by 2030."}'
 ```
 
-Response:
+Response (Pydantic `ExtractionResult.model_dump()` format):
 ```json
 {
-  "output": "<statements><stmt>...</stmt></statements>",
-  "success": true,
-  "error": null
+  "statements": [
+    {
+      "subject": {"text": "Apple Inc.", "type": "ORG"},
+      "predicate": "committed to",
+      "object": {"text": "carbon neutrality by 2030", "type": "EVENT"},
+      "source_text": "Apple Inc. announced a commitment to carbon neutrality by 2030.",
+      "confidence_score": 0.85
+    }
+  ],
+  "source_text": "<page>Apple Inc. announced a commitment to carbon neutrality by 2030.</page>",
+  "cached": false
 }
 ```
 

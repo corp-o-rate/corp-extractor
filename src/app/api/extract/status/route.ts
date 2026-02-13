@@ -50,62 +50,29 @@ export async function GET(request: NextRequest) {
 
     // Handle completed job - parse the output
     if (data.status === 'COMPLETED' && data.output) {
-      // Check if this is a URL job result (has metadata field)
-      if (data.output.metadata && data.output.statements) {
-        // URL job result - statements are already structured
-        const urlStatements = data.output.statements.map((stmt: {
-          subject?: { text?: string; type?: string };
-          object?: { text?: string; type?: string };
-          predicate?: string;
-          text?: string;
-          labels?: Record<string, string>;
-          taxonomy?: Array<{ taxonomy: string; category: string; label: string; confidence: number }>;
-        }) => ({
-          subject: {
-            name: stmt.subject?.text || '',
-            type: stmt.subject?.type || 'UNKNOWN',
-          },
-          object: {
-            name: stmt.object?.text || '',
-            type: stmt.object?.type || 'UNKNOWN',
-          },
-          predicate: stmt.predicate || '',
-          text: stmt.text || '',
-          labels: stmt.labels ? Object.entries(stmt.labels).map(([k, v]) => ({
-            label_type: k,
-            label_value: v,
-            confidence: 1.0,
-          })) : undefined,
-          taxonomyResults: stmt.taxonomy?.map(t => ({
-            taxonomy_name: t.taxonomy,
-            category: t.category,
-            label: t.label,
-            confidence: t.confidence,
-          })),
-        }));
+      // Check if this is a URL/document job result (DocumentContext model_dump format)
+      if (data.output.document && data.output.labeled_statements) {
+        // DocumentContext model_dump format — use parseStatements which handles model_dump
+        const statements = parseStatements(data.output);
 
         return NextResponse.json({
           status: 'COMPLETED',
-          statements: urlStatements,
-          metadata: data.output.metadata,
-          summary: data.output.summary,
+          statements,
+          metadata: {
+            title: data.output.document?.metadata?.title,
+            chunk_count: data.output.chunks?.length || 0,
+            statement_count: data.output.labeled_statements?.length || 0,
+            duplicates_removed: (data.output.pre_dedup_count || 0) - (data.output.post_dedup_count || 0),
+          },
+          summary: data.output.document?.summary,
           cached: data.output.cached || false,
         });
       }
 
-      // Regular text extraction result
-      // Check if response is in new JSON format (v0.2.0+)
+      // Regular text extraction result (ExtractionResult model_dump format)
+      // Also handle legacy format with output.output wrapper
       const outputData = data.output.output || data.output;
-      const isJsonFormat = data.output.format === 'json' || (typeof outputData === 'object' && outputData.statements);
-
-      let statements;
-      if (isJsonFormat) {
-        // New JSON format - already parsed or needs parsing
-        statements = parseStatements(outputData);
-      } else {
-        // Legacy XML format
-        statements = parseStatements(outputData);
-      }
+      const statements = parseStatements(outputData);
 
       // Cache the result if we have the input text
       // Note: setCachedStatements will skip empty results to prevent caching failures/timeouts
@@ -116,7 +83,7 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({
         status: 'COMPLETED',
         statements,
-        cached: false,
+        cached: data.output.cached || false,
       });
     }
 

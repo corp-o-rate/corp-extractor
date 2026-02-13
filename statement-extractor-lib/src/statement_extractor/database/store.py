@@ -2486,6 +2486,11 @@ class OrganizationDatabase:
         """
         conn = self._connect()
 
+        # v2 schema uses region_id (FK to locations) instead of region text - this method doesn't apply
+        if self._is_v2:
+            logger.debug("Skipping resolve_qid_labels for v2 schema (region stored as FK)")
+            return 0, 0
+
         # Find records with QIDs in region field (starts with 'Q' followed by digits)
         region_updates = 0
         cursor = conn.execute("""
@@ -2547,6 +2552,10 @@ class OrganizationDatabase:
         Returns:
             Set of QIDs (starting with 'Q') found in region field
         """
+        # v2 schema uses region_id (FK to locations) instead of region text - no QIDs to resolve
+        if self._is_v2:
+            return set()
+
         conn = self._connect()
         qids: set[str] = set()
 

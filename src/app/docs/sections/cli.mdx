@@ -38,12 +38,64 @@ The `corp-extractor` CLI provides commands for extraction, document processing, 
       <td>Import, search, upload/download entity database</td>
     </tr>
     <tr>
+      <td><code>serve</code></td>
+      <td>Persistent local server</td>
+      <td>Keep models warm in memory for fast repeated use</td>
+    </tr>
+    <tr>
       <td><code>plugins</code></td>
       <td>Plugin management</td>
       <td>List and inspect available plugins</td>
     </tr>
   </tbody>
 </table>
+
+### Global Options
+
+<span id="global-options" />
+
+These options apply to all commands when placed before the command name:
+
+<table>
+  <thead>
+    <tr>
+      <th>Option</th>
+      <th>Description</th>
+      <th>Default</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>--server</code></td>
+      <td>Delegate processing to a running <code>corp-extractor serve</code> instance at the default URL</td>
+      <td>http://localhost:8111</td>
+    </tr>
+    <tr>
+      <td><code>--server-url URL</code></td>
+      <td>Delegate processing to a server at a custom URL</td>
+      <td>—</td>
+    </tr>
+    <tr>
+      <td><code>--db-version N</code></td>
+      <td>Database schema version for filenames</td>
+      <td>latest (3)</td>
+    </tr>
+  </tbody>
+</table>
+
+The `CORP_EXTRACTOR_SERVER` environment variable can also be set to a server URL, which acts as a fallback when neither `--server` nor `--server-url` is provided.
+
+```bash
+# Use the default server URL (http://localhost:8111)
+corp-extractor --server pipeline "Apple announced a new iPhone."
+
+# Use a custom server URL
+corp-extractor --server-url http://gpu-box:8111 pipeline "Apple announced a new iPhone."
+
+# Or set via environment variable
+export CORP_EXTRACTOR_SERVER=http://localhost:8111
+corp-extractor pipeline "Apple announced a new iPhone."
+```
 
 ### Installation
 
@@ -336,6 +388,115 @@ Stage 5: Taxonomy
 ----------------------------------------
   embedding_taxonomy_classifier  [priority: 100]
 ```
+
+---
+
+### Serve Command
+
+<span id="serve-command" />
+
+<span className="text-xs font-medium bg-green-100 dark:bg-green-900 text-green-800 dark:text-green-200 px-2 py-0.5 rounded">NEW in v0.9.7</span>
+
+The `serve` command starts a persistent local FastAPI server that keeps all models warm in memory. This eliminates the ~30s startup cost for repeated CLI invocations.
+
+```bash
+# Start the server (default: 0.0.0.0:8111)
+corp-extractor serve
+
+# Custom host and port
+corp-extractor serve --host 127.0.0.1 --port 9000
+
+# Skip model warmup (models load on first request)
+corp-extractor serve --no-warmup
+
+# Verbose logging
+corp-extractor serve -v
+```
+
+Once the server is running, use `--server` with any extraction command to delegate processing:
+
+```bash
+# In another terminal
+corp-extractor --server split "Apple announced a new iPhone."
+corp-extractor --server pipeline "Amazon CEO Andy Jassy announced plans."
+corp-extractor --server pipeline -f article.txt -o json
+corp-extractor --server document process article.txt
+```
+
+For Python API delegation, pass `server_url` to any extraction function (see [Examples](/docs#persistent-server)):
+
+```python
+from statement_extractor import extract_statements
+result = extract_statements("text", server_url="http://localhost:8111")
+```
+
+#### Serve Options
+
+<table>
+  <thead>
+    <tr>
+      <th>Option</th>
+      <th>Description</th>
+      <th>Default</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>--host</code></td>
+      <td>Bind address</td>
+      <td>0.0.0.0</td>
+    </tr>
+    <tr>
+      <td><code>--port</code></td>
+      <td>Port number</td>
+      <td>8111</td>
+    </tr>
+    <tr>
+      <td><code>--no-warmup</code></td>
+      <td>Skip eager model loading (models load on first request)</td>
+      <td>—</td>
+    </tr>
+    <tr>
+      <td><code>-v, --verbose</code></td>
+      <td>Enable debug logging</td>
+      <td>—</td>
+    </tr>
+  </tbody>
+</table>
+
+#### Server Endpoints
+
+<table>
+  <thead>
+    <tr>
+      <th>Endpoint</th>
+      <th>Method</th>
+      <th>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>/</code></td>
+      <td>GET</td>
+      <td>Health check — device info, loaded models, registered plugins</td>
+    </tr>
+    <tr>
+      <td><code>/pipeline</code></td>
+      <td>POST</td>
+      <td>Full extraction pipeline — returns <code>PipelineContext</code> model_dump JSON</td>
+    </tr>
+    <tr>
+      <td><code>/split</code></td>
+      <td>POST</td>
+      <td>Stage 1 extraction only — returns <code>ExtractionResult</code> model_dump JSON</td>
+    </tr>
+    <tr>
+      <td><code>/document</code></td>
+      <td>POST</td>
+      <td>Document pipeline — returns <code>DocumentContext</code> model_dump JSON</td>
+    </tr>
+  </tbody>
+</table>
 
 ---
 

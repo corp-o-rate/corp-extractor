@@ -27,6 +27,13 @@ uv run corp-extractor pipeline "text"        # Full 5-stage pipeline
 uv run corp-extractor pipeline "text" -v     # Verbose with debug logs
 uv run corp-extractor plugins list           # List registered plugins
 
+# Persistent server (v0.9.7) — keeps models warm for fast repeated use
+uv run corp-extractor serve                  # Start on localhost:8111
+uv run corp-extractor serve --port 9000      # Custom port
+uv run corp-extractor serve --no-warmup      # Skip eager model loading
+uv run corp-extractor --server pipeline "text"  # Delegate to running server
+uv run corp-extractor --server-url http://gpu:8111 split "text"  # Custom server URL
+
 # Entity database commands
 uv run corp-extractor db status              # Show database stats
 uv run corp-extractor db status --for-llm    # Output schema/enum tables for LLM docs
@@ -119,7 +126,19 @@ Plugins are sorted by `priority` property (lower = runs first). Default is 100.
 - `plugins/base.py` - Abstract base classes for all plugin types
 - `plugins/extractors/gliner2.py` - GLiNER2 entity/relation extraction (Stage 2)
 - `plugins/taxonomy/embedding.py` - Embedding-based taxonomy classification (Stage 5)
-- `cli.py` - CLI entry point (`corp-extractor` command)
+- `cli.py` - CLI entry point (thin wrapper, delegates to `commands/`)
+- `commands/` - CLI command package:
+  - `__init__.py` - Main click group + command registration
+  - `_common.py` - Shared utilities (`_configure_logging`, `_resolve_db_path`, `_server_request`, etc.)
+  - `split.py`, `pipeline.py`, `plugins.py`, `serve.py`, `document.py` - Top-level commands
+  - `db/__init__.py` - `db` group + subcommand registration
+  - `db/imports.py` - Import commands (GLEIF, SEC, Companies House, Wikidata, people, locations)
+  - `db/wikidata_dump.py` - Wikidata dump import (3-thread reader/embedder/writer pipeline)
+  - `db/search.py` - Search commands (orgs, people, roles, locations, perf test)
+  - `db/management.py` - Status, canonicalize, download, upload, migrations, index building
+  - `db/repair.py` - Repair/fix-resume commands for people records
+- `server.py` - FastAPI persistent server (`corp-extractor serve`). Endpoints: `GET /` (health), `POST /pipeline`, `POST /split`, `POST /document`. All endpoints return Pydantic `model_dump()` JSON. Keeps models warm in memory. CLI delegates via `--server` / `--server-url` / `CORP_EXTRACTOR_SERVER` env var.
+- `client.py` - HTTP client for server delegation (v0.9.8). Functions: `server_split()`, `server_pipeline()`, `server_document()`. Sends requests to a running server and reconstructs full Pydantic models via `model_validate()`. Used by `extract_statements(server_url=...)`, `ExtractionPipeline(server_url=...)`, `DocumentPipeline(server_url=...)`.
 
 ### Entity Database Module
 

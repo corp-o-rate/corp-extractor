@@ -75,6 +75,10 @@ corp-extractor pipeline -f article.txt --stages 1-3
 corp-extractor document process report.pdf
 corp-extractor document process report.pdf --pdf-parser glm_ocr_parser
 
+# Persistent server mode (keeps models warm for fast repeated use)
+corp-extractor serve                                          # Start server on port 8111
+corp-extractor --server pipeline "Apple CEO Tim Cook..."      # Delegate to server
+
 # List available plugins
 corp-extractor plugins list
 ```
@@ -96,6 +100,10 @@ pipeline = ExtractionPipeline()
 ctx = pipeline.process("Apple CEO Tim Cook announced...")
 for stmt in ctx.labeled_statements:
     print(f"{stmt.subject_fqn} -> {stmt.statement.predicate} -> {stmt.object_fqn}")
+
+# Delegate to a running server (v0.9.8) — no local GPU needed
+result = extract_statements("text", server_url="http://localhost:8111")
+pipeline = ExtractionPipeline(server_url="http://localhost:8111")
 ```
 
 See [statement-extractor-lib/README.md](statement-extractor-lib/README.md) for full pipeline documentation.
@@ -257,7 +265,8 @@ uv run python upload_model.py
 |----------|-------------|
 | `RUNPOD_ENDPOINT_ID` | RunPod endpoint ID (recommended for production) |
 | `RUNPOD_API_KEY` | RunPod API key |
-| `LOCAL_MODEL_URL` | Local server URL (e.g., `http://localhost:8000`) |
+| `LOCAL_MODEL_URL` | Local server URL for web demo (e.g., `http://localhost:8000`) |
+| `CORP_EXTRACTOR_SERVER` | Corp-extractor persistent server URL (e.g., `http://localhost:8111`) |
 
 ## Tech Stack
 

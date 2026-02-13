@@ -103,7 +103,7 @@ uvx corp-extractor "Apple announced a new iPhone."
 
 ### Usage Examples
 
-The CLI provides three main commands: `split`, `pipeline`, and `plugins`.
+The CLI provides commands for extraction (`split`, `pipeline`), document processing, database management, and a persistent server.
 
 ```bash
 # Simple extraction (Stage 1 only, fast)
@@ -114,6 +114,11 @@ corp-extractor split -f article.txt --json
 corp-extractor pipeline "Amazon CEO Andy Jassy announced plans to hire workers."
 corp-extractor pipeline -f article.txt --stages 1-3
 corp-extractor pipeline "..." --disable-plugins sec_edgar
+
+# Persistent server — keeps models warm for fast repeated use (v0.9.7)
+corp-extractor serve                                        # Start on localhost:8111
+corp-extractor --server pipeline "Amazon CEO Andy Jassy..."  # Delegate to server
+corp-extractor --server-url http://gpu:8111 split "text"     # Custom server URL
 
 # Plugin management
 corp-extractor plugins list
@@ -148,11 +153,19 @@ corp-extractor pipeline "..." --disable-plugins sec_edgar
 ### CLI Reference
 
 ```
-Usage: corp-extractor [COMMAND] [OPTIONS]
+Usage: corp-extractor [OPTIONS] COMMAND [ARGS]...
+
+Global Options:
+  --server                     Use local server at http://localhost:8111
+  --server-url URL             Use server at custom URL
+  --db-version N               Database schema version (default: latest)
 
 Commands:
   split      Simple extraction (T5-Gemma only)
   pipeline   Full 5-stage pipeline with entity resolution
+  document   Document processing (files, URLs, PDFs)
+  db         Entity database management
+  serve      Start persistent local server
   plugins    List or inspect available plugins
 
 Split Options:
@@ -171,6 +184,84 @@ Pipeline Options:
   --plugins TEXT               Enable only these plugins (comma-separated)
   --disable-plugins TEXT       Disable these plugins (comma-separated)
   -o, --output [table|json|yaml|triples]  Output format
+
+Serve Options:
+  --host TEXT                  Bind address (default: 0.0.0.0)
+  --port INTEGER               Port number (default: 8111)
+  --no-warmup                  Skip eager model loading
+  -v, --verbose                Enable debug logging
+
+Environment Variables:
+  CORP_EXTRACTOR_SERVER        Server URL fallback (e.g., http://localhost:8111)
+```
+
+## Persistent Server (v0.9.7)
+
+The `corp-extractor serve` command starts a FastAPI server that keeps all models (T5-Gemma, GLiNER2, embedding models, USearch indexes) warm in memory. This eliminates the ~30s startup cost for repeated CLI invocations.
+
+```bash
+# Start the server
+corp-extractor serve                    # Default: 0.0.0.0:8111
+corp-extractor serve --port 9000        # Custom port
+corp-extractor serve --no-warmup        # Skip eager model loading
+
+# Use from CLI (in another terminal)
+corp-extractor --server pipeline "Apple CEO Tim Cook announced..."
+corp-extractor --server split -f article.txt --json
+corp-extractor --server document process article.txt
+
+# Or set the environment variable
+export CORP_EXTRACTOR_SERVER=http://localhost:8111
+corp-extractor pipeline "text"          # Automatically delegates to server
+```
+
+### Python API Server Delegation (v0.9.8)
+
+All Python API functions accept a `server_url` parameter to delegate processing to a running server instead of loading models locally. This is useful for machines without a GPU or when you want to share a single model instance.
+
+```python
+from statement_extractor import extract_statements
+from statement_extractor.pipeline import ExtractionPipeline
+from statement_extractor.document import DocumentPipeline
+
+# Simple extraction via server
+result = extract_statements("Apple announced iPhone.", server_url="http://localhost:8111")
+for stmt in result:
+    print(f"{stmt.subject.text} -> {stmt.predicate} -> {stmt.object.text}")
+
+# Full pipeline via server
+pipeline = ExtractionPipeline(server_url="http://localhost:8111")
+ctx = pipeline.process("Amazon CEO Andy Jassy announced...")
+for stmt in ctx.labeled_statements:
+    print(f"{stmt.subject_fqn} -> {stmt.statement.predicate} -> {stmt.object_fqn}")
+
+# Document pipeline via server
+doc_pipeline = DocumentPipeline(server_url="http://localhost:8111")
+ctx = doc_pipeline.process(document)
+```
+
+When `server_url` is provided, no local models are loaded — the HTTP client sends the request to the server and reconstructs the full Pydantic response objects (`ExtractionResult`, `PipelineContext`, `DocumentContext`) from the JSON response.
+
+> **Note:** The `server_url` parameter is Python API only. For CLI delegation, use `--server` / `--server-url` flags or the `CORP_EXTRACTOR_SERVER` environment variable.
+
+### Server Endpoints
+
+The server exposes three POST endpoints that mirror the CLI commands:
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /` | Health check — device info, loaded models, registered plugins |
+| `POST /pipeline` | Full extraction pipeline (returns `PipelineContext` model_dump) |
+| `POST /split` | Stage 1 extraction only (returns `ExtractionResult` model_dump) |
+| `POST /document` | Document pipeline for text input (returns `DocumentContext` model_dump) |
+
+All endpoints return standardized Pydantic `model_dump()` JSON. You can also call the server directly with any HTTP client:
+
+```bash
+curl http://localhost:8111/                          # Health check
+curl -X POST http://localhost:8111/split \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Apple announced a new iPhone."}'
 ```
 
 ## Quality Scoring & Beam Merging

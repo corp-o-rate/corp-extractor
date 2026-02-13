@@ -75,6 +75,22 @@ corp-extractor -f article.txt --device cuda
 corp-extractor -f article.txt --min-confidence 0.7
 
 # ============================================
+# Persistent Server (v0.9.7)
+# ============================================
+
+# Start a server to keep models warm (avoids ~30s startup)
+corp-extractor serve                    # Start on localhost:8111
+corp-extractor serve --port 9000        # Custom port
+
+# Use --server to delegate to a running server
+corp-extractor --server pipeline "Amazon CEO Andy Jassy..."
+corp-extractor --server split -f article.txt --json
+
+# Or set the environment variable
+export CORP_EXTRACTOR_SERVER=http://localhost:8111
+corp-extractor pipeline "text"  # Automatically uses the server
+
+# ============================================
 # All CLI Options
 # ============================================
 # corp-extractor --help
@@ -191,6 +207,17 @@ from statement_extractor import (
 json_output = extract_statements_as_json(text)
 xml_output = extract_statements_as_xml(text)
 dict_output = extract_statements_as_dict(text)
+
+# ============================================
+# Server Delegation (v0.9.8)
+# ============================================
+# Delegate to a running server — no local GPU needed
+result = extract_statements(text, server_url="http://localhost:8111")
+
+# Pipeline and document pipeline also support server_url
+from statement_extractor.pipeline import ExtractionPipeline
+pipeline = ExtractionPipeline(server_url="http://localhost:8111")
+ctx = pipeline.process(text)
 
 # ============================================
 # Batch Processing

@@ -60,6 +60,56 @@ extractor = StatementExtractor(device="cpu")   # CPU
 
 The model uses bfloat16 precision on GPU for faster inference and lower memory usage, and float32 on CPU.
 
+### Persistent Server
+
+<span id="persistent-server" />
+
+<span className="text-xs font-medium bg-green-100 dark:bg-green-900 text-green-800 dark:text-green-200 px-2 py-0.5 rounded">NEW in v0.9.7</span>
+
+For repeated extractions, use `corp-extractor serve` to keep all models warm in memory. This eliminates the ~30s startup cost for each invocation.
+
+```bash
+# Start the persistent server
+corp-extractor serve
+
+# In another terminal, use --server to delegate to it
+corp-extractor --server pipeline "Amazon CEO Andy Jassy announced..."
+corp-extractor --server split -f article.txt --json
+corp-extractor --server document process article.txt
+```
+
+The server runs on `http://localhost:8111` by default and exposes three POST endpoints (`/pipeline`, `/split`, `/document`) plus a health check at `GET /`. All models (T5-Gemma, GLiNER2, embedding models, USearch indexes) are loaded once at startup and reused across requests.
+
+You can also set the `CORP_EXTRACTOR_SERVER` environment variable so all CLI commands automatically delegate to the server:
+
+```bash
+export CORP_EXTRACTOR_SERVER=http://localhost:8111
+corp-extractor pipeline "Your text"  # Automatically uses the server
+```
+
+#### Python API Server Delegation
+
+<span className="text-xs font-medium bg-green-100 dark:bg-green-900 text-green-800 dark:text-green-200 px-2 py-0.5 rounded">NEW in v0.9.8</span>
+
+All Python API functions accept a `server_url` parameter to delegate processing to a running server. No local models are loaded — requests go over HTTP and full Pydantic objects are reconstructed from the response.
+
+```python
+from statement_extractor import extract_statements
+from statement_extractor.pipeline import ExtractionPipeline
+from statement_extractor.document import DocumentPipeline
+
+# Delegate extraction to server
+result = extract_statements("text", server_url="http://localhost:8111")
+
+# Pipeline and document pipeline
+pipeline = ExtractionPipeline(server_url="http://localhost:8111")
+ctx = pipeline.process("Amazon CEO Andy Jassy announced...")
+
+doc_pipeline = DocumentPipeline(server_url="http://localhost:8111")
+```
+
+> **Note:** `server_url` is for the Python API only. CLI delegation uses `--server` / `--server-url` flags or the `CORP_EXTRACTOR_SERVER` env var.
+
 ### RunPod Serverless
 
 <span id="runpod-serverless" />

@@ -107,11 +107,13 @@ export async function POST(request: NextRequest) {
 
         if (localResponse.ok) {
           const data = await localResponse.json();
-          const statements = parseStatements(data.output || data.result);
+          // New format: ExtractionResult model_dump {statements: [...], source_text, cached}
+          // Also support legacy format: {output: "xml string", success: true}
+          const statements = parseStatements(data.output || data);
 
           const result: ExtractionResult = {
             statements,
-            cached: false,
+            cached: data.cached || false,
             inputText: text,
           };
 

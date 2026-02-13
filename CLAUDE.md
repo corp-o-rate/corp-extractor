@@ -71,6 +71,11 @@ uv publish                     # Publish to PyPI (requires credentials)
 corp-extractor split "text"    # Simple extraction
 corp-extractor pipeline "text" # Full 5-stage pipeline
 corp-extractor plugins list    # List available plugins
+
+# Persistent server (keeps models warm, avoids ~30s startup per invocation)
+corp-extractor serve                                     # Start on localhost:8111
+corp-extractor --server pipeline "text"                  # Delegate to server
+corp-extractor --server-url http://gpu:8111 split "text" # Custom server URL
 ```
 
 ## Architecture
@@ -100,6 +105,8 @@ The frontend can connect to the model via three backends (configured by environm
 - RunPod requires `--platform linux/amd64` when building Docker on Mac
 - Model uses bfloat16 on GPU, float32 on CPU
 - Generation stops at `</statements>` tag to prevent runaway output
+- **v0.9.8**: Python API server delegation via `server_url=` parameter on `extract_statements()`, `ExtractionPipeline`, and `DocumentPipeline`. New `client.py` module handles HTTP delegation and Pydantic model reconstruction. All backends (server, RunPod, local-server) now return standardized `model_dump()` format — no more XML strings or custom wrappers. CLI reconstructs full Pydantic models from server JSON, eliminating duplicate formatting code.
+- **v0.9.7**: Persistent local server (`corp-extractor serve`) with FastAPI. Keeps T5-Gemma, GLiNER2, embedding models, and USearch indexes warm in memory. Endpoints: `GET /` (health), `POST /pipeline`, `POST /split`, `POST /document`. CLI `--server` / `--server-url` flags and `CORP_EXTRACTOR_SERVER` env var to delegate processing to server. Default port 8111.
 - **v0.9.6**: Database v3 schema — `db_info` metadata table with `schema_version=3`. Lite databases drop ALL embedding tables (float32 + scalar int8) — uses USearch index files for search. `db upload` now includes USearch `.bin` files. `db download` fetches USearch indexes alongside database. Filenames: `entities-v3.db` / `entities-v3-lite.db`. Global `--db-version` CLI flag for backwards compatibility (`corp-extractor --db-version=2 db download`). Symlink `entities-v2.db` → v3 file on download for backwards compat.
 - **v0.9.5**: USearch HNSW indexes for sub-millisecond search on 50M+ vectors. 3-thread parallel Wikidata dump import (reader/embedder/writer). Multi-record person import (one person per position+org). Auto-canonicalization after dump import with recency tiebreaker. New CLI: `db post-import`, `db build-index`, `db rebuild-vec`. `--hybrid` flag for text+embeddings search. `fast-import` extras (orjson, indexed_bzip2). Zstandard (.zst) dump support. New `hf_classifier` labeler plugin.
 - **v0.9.4**: Database v2 schema with normalized FK references (replaces TEXT enums with INTEGER FKs). New tables: `roles`, `locations`, `location_types`. Scalar (int8) embeddings for 75% storage reduction (~92% recall). New CLI: `db migrate-v2`, `db backfill-scalar`, `db search-roles`, `db search-locations`. Locations import via `--locations` flag.
@@ -199,6 +206,24 @@ for stmt in result:
     print(f"{stmt.subject.text} -> {stmt.predicate} -> {stmt.object.text}")
 ```
 
+**Server delegation (v0.9.8):**
+```python
+from statement_extractor import extract_statements
+from statement_extractor.pipeline import ExtractionPipeline
+from statement_extractor.document import DocumentPipeline
+
+# Delegate to a running server instead of loading models locally
+result = extract_statements("Apple announced iPhone.", server_url="http://localhost:8111")
+
+# Pipeline with server delegation
+pipeline = ExtractionPipeline(server_url="http://localhost:8111")
+ctx = pipeline.process("Amazon CEO Andy Jassy announced...")
+
+# Document pipeline with server delegation
+doc_pipeline = DocumentPipeline(server_url="http://localhost:8111")
+ctx = doc_pipeline.process(document)
+```
+
 **Full pipeline (v0.5.0):**
 ```python
 from statement_extractor.pipeline import ExtractionPipeline, PipelineConfig
@@ -225,6 +250,13 @@ corp-extractor split "text"              # Simple extraction
 corp-extractor pipeline "text"           # Full pipeline
 corp-extractor pipeline "text" --stages 1-3
 corp-extractor plugins list              # List plugins
+
+# Persistent server (v0.9.7) — keeps models warm for fast repeated use
+corp-extractor serve                     # Start on localhost:8111
+corp-extractor serve --port 9000         # Custom port
+corp-extractor --server pipeline "text"  # Delegate to server
+corp-extractor --server-url http://gpu:8111 split "text"  # Custom server URL
+# Or set CORP_EXTRACTOR_SERVER=http://localhost:8111 in environment
 
 # Document processing (v0.7.0)
 corp-extractor document process article.txt

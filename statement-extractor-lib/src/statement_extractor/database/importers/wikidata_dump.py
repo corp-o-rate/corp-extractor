@@ -705,6 +705,12 @@ class WikidataDumpImporter:
         self._unresolved_qids: set[str] = set()
         # Label cache built during dump processing
         self._label_cache: dict[str, str] = {}
+        # Track labels added since last flush (avoids scanning full cache)
+        self._new_labels: dict[str, str] = {}
+        # Cache position item → jurisdiction QID (e.g. Q11696 "President of the United States" → Q30 "United States")
+        # Built from all entities with P31=Q4164871 (position) that have P1001 or P17.
+        # Used to backfill org context for P39 claims without qualifier-level org.
+        self._position_jurisdictions: dict[str, str] = {}
 
     def download_dump(
         self,
@@ -931,15 +937,46 @@ class WikidataDumpImporter:
             skipped_count = 0
             next_log_threshold = 10_000
 
+            # === Fast skip phase: no JSON parsing, just count entity lines ===
+            # Labels from the previous run are already in the DB and loaded into
+            # the label cache at startup. Parsing JSON here was the #1 memory
+            # killer — each entity dict is large and the label cache grew to
+            # 100M+ entries.
+            if start_index > 0:
+                logger.info(f"Fast-skipping {start_index:,} entities (no JSON parsing)...")
+                for line in file_handle:
+                    line_count += 1
+                    stripped = line.strip()
+                    if not stripped or stripped in ("[", "]"):
+                        continue
+
+                    entity_count += 1
+                    skipped_count += 1
+
+                    if skipped_count >= next_log_threshold:
+                        pct = 100 * skipped_count / start_index
+                        logger.info(
+                            f"Skipping... {skipped_count:,}/{start_index:,} entities ({pct:.1f}%)"
+                        )
+                        if next_log_threshold < 100_000:
+                            next_log_threshold = 100_000
+                        elif next_log_threshold < 1_000_000:
+                            next_log_threshold = 1_000_000
+                        else:
+                            next_log_threshold += 1_000_000
+
+                    if entity_count >= start_index:
+                        break
+
+                logger.info(f"Skip complete: {skipped_count:,} entities skipped, resuming processing")
+                next_log_threshold = entity_count + 100_000
+
+            # === Processing phase: parse JSON and yield entities ===
             for line in file_handle:
                 line_count += 1
 
-                if line_count <= 5:
+                if line_count <= 5 and start_index == 0:
                     logger.info(f"Read line {line_count} ({len(line)} chars)")
-                elif line_count == 100:
-                    logger.info(f"Read {line_count} lines...")
-                elif line_count == 1000:
-                    logger.info(f"Read {line_count} lines...")
 
                 line = line.strip()
 
@@ -956,28 +993,10 @@ class WikidataDumpImporter:
                     entity = _json_loads(line)
                     entity_id = entity.get("id", "")
 
-                    # Cache label for QID lookups — only during resume skip phase
-                    # to populate cache for later entity resolution
-                    if entity_count < start_index:
-                        self._cache_entity_label(entity)
-                        entity_count += 1
-                        skipped_count += 1
-                        if skipped_count >= next_log_threshold:
-                            pct = 100 * skipped_count / start_index if start_index > 0 else 0
-                            logger.info(
-                                f"Skipping... {skipped_count:,}/{start_index:,} entities "
-                                f"({pct:.1f}%), label cache: {len(self._label_cache):,}"
-                            )
-                            if next_log_threshold < 100_000:
-                                next_log_threshold = 100_000
-                            elif next_log_threshold < 1_000_000:
-                                next_log_threshold = 1_000_000
-                            else:
-                                next_log_threshold += 1_000_000
-                        continue
-
                     # Cache label for entities we actually process
                     self._cache_entity_label(entity)
+                    # Cache jurisdiction for position items (cheap — just check for P1001/P17)
+                    self._cache_position_jurisdiction(entity)
                     entity_count += 1
 
                     if entity_count >= next_log_threshold:
@@ -1495,11 +1514,12 @@ class WikidataDumpImporter:
             qualifiers = claim.get("qualifiers", {})
 
             # Extract organization from multiple possible qualifiers
-            # Priority: P108 (employer) > P642 (of) > P1001 (jurisdiction)
+            # Priority: P108 (employer) > P642 (of) > P1001 (jurisdiction) > position item's P1001/P17
             org_qid = (
                 self._get_qid_qualifier(qualifiers, "P108") or  # employer
                 self._get_qid_qualifier(qualifiers, "P642") or  # of (legacy)
-                self._get_qid_qualifier(qualifiers, "P1001")    # applies to jurisdiction
+                self._get_qid_qualifier(qualifiers, "P1001") or  # applies to jurisdiction
+                self._position_jurisdictions.get(pos_qid, "")   # position item's own jurisdiction
             )
 
             # Extract dates
@@ -1744,8 +1764,9 @@ class WikidataDumpImporter:
         def make_record(
             role_qid: str, org_qid: str, start_date: Optional[str], end_date: Optional[str],
             extra_context: Optional[dict] = None,
+            role_label_override: str = "",
         ) -> PersonRecord:
-            role_label = self._resolve_qid(role_qid) if role_qid else ""
+            role_label = role_label_override or (self._resolve_qid(role_qid) if role_qid else "")
             org_label = self._resolve_qid(org_qid) if org_qid else ""
 
             # Track discovered org
@@ -1780,11 +1801,11 @@ class WikidataDumpImporter:
         seen_role_org: set[tuple[str, str]] = set()
 
         for pos in positions:
-            org_qid = self._get_org_or_context(pos)
-            if not org_qid:
+            org_qid_pos = self._get_org_or_context(pos)
+            if not org_qid_pos:
                 continue
-            role_qid = pos["position_qid"]
-            key = (role_qid, org_qid)
+            role_qid_pos = pos["position_qid"]
+            key = (role_qid_pos, org_qid_pos)
             if key in seen_role_org:
                 continue
             seen_role_org.add(key)
@@ -1798,16 +1819,38 @@ class WikidataDumpImporter:
                 }.items() if v
             }
             records.append(make_record(
-                role_qid, org_qid, pos.get("start_date"), pos.get("end_date"), extra_context,
+                role_qid_pos, org_qid_pos, pos.get("start_date"), pos.get("end_date"), extra_context,
             ))
             if len(records) >= MAX_RECORDS_PER_PERSON:
                 break
+
+        # --- Supplement with reverse org→person mappings (P169 CEO, P488 chair, etc.) ---
+        # These come from org entities that list this person as an executive.
+        # Creates additional records for roles not already covered by P39 qualifiers.
+        if len(records) < MAX_RECORDS_PER_PERSON and qid in self._reverse_person_orgs:
+            for rev_org_qid, rev_role, rev_start, rev_end in self._reverse_person_orgs[qid]:
+                if len(records) >= MAX_RECORDS_PER_PERSON:
+                    break
+                # Deduplicate: skip if we already have a record for this org
+                # (use org only since reverse role is a label string, not a QID)
+                if any(rev_org_qid == key[1] for key in seen_role_org):
+                    continue
+                # Use a sentinel role_qid for reverse-mapped records
+                seen_role_org.add(("_reverse", rev_org_qid))
+                records.append(make_record(
+                    "", rev_org_qid, rev_start, rev_end,
+                    role_label_override=rev_role,
+                ))
+                logger.debug(
+                    f"Added reverse-mapped record for {qid} ({label}): "
+                    f"{rev_org_qid} as {rev_role}"
+                )
 
         if records:
             logger.debug(f"{qid} ({label}): {len(records)} position records")
             return records
 
-        # --- Fallback: single record (no positions had orgs) ---
+        # --- Fallback: single record (no positions had orgs, no reverse mappings) ---
         # Use _get_best_role_org for the single best position
         role_qid, _, org_qid, start_date, end_date, extra_context = self._get_best_role_org(positions)
 
@@ -1817,17 +1860,6 @@ class WikidataDumpImporter:
             if employers:
                 org_qid = employers[0]
                 logger.debug(f"Using top-level P108 employer for {qid}: {org_qid}")
-
-        # Fallback: reverse lookup from org entities (P169 CEO, P488 chair, etc.)
-        if not org_qid and qid in self._reverse_person_orgs:
-            # Use first reverse mapping for the single-record fallback
-            rev_org_qid, reverse_role, rev_start, rev_end = self._reverse_person_orgs[qid][0]
-            org_qid = rev_org_qid
-            if not start_date:
-                start_date = rev_start
-            if not end_date:
-                end_date = rev_end
-            logger.debug(f"Using reverse org lookup for {qid}: {org_qid} ({reverse_role})")
 
         # Fallback chain: type-specific properties
         if not org_qid:
@@ -1907,6 +1939,7 @@ class WikidataDumpImporter:
             ("P1037", "director/manager"),
             ("P3320", "board member"),
         ]
+        executives: list[dict[str, Any]] = []
         for prop, role_desc in executive_props:
             for claim in claims.get(prop, []):
                 mainsnak = claim.get("mainsnak", {})
@@ -1919,10 +1952,27 @@ class WikidataDumpImporter:
                 self._reverse_person_orgs.setdefault(person_qid, []).append(
                     (qid, role_desc, start_date, end_date)
                 )
+                executives.append({
+                    "person_qid": person_qid,
+                    "role": role_desc,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                })
                 logger.debug(
                     f"Reverse mapping: {person_qid} → {qid} ({label}) as {role_desc} "
                     f"({start_date or '?'} – {end_date or '?'})"
                 )
+
+        record_data: dict[str, Any] = {
+            "wikidata_id": qid,
+            "label": label,
+            "description": description,
+            "lei": lei,
+            "ticker": ticker,
+            "country_qid": country_qid,
+        }
+        if executives:
+            record_data["executives"] = executives
 
         return CompanyRecord(
             name=label,
@@ -1932,14 +1982,7 @@ class WikidataDumpImporter:
             entity_type=entity_type,
             from_date=inception,
             to_date=dissolution,
-            record={
-                "wikidata_id": qid,
-                "label": label,
-                "description": description,
-                "lei": lei,
-                "ticker": ticker,
-                "country_qid": country_qid,
-            },
+            record=record_data,
         )
 
     def _process_location_entity(
@@ -2235,9 +2278,14 @@ class WikidataDumpImporter:
         """Get QIDs that need label resolution."""
         return self._unresolved_qids.copy()
 
-    def get_label_cache(self) -> dict[str, str]:
-        """Get the label cache built during import."""
-        return self._label_cache.copy()
+    def get_label_cache(self, copy: bool = True) -> dict[str, str]:
+        """Get the label cache built during import.
+
+        Args:
+            copy: If True, return a copy (thread-safe). If False, return
+                  the live dict (caller must not mutate).
+        """
+        return dict(self._label_cache) if copy else self._label_cache
 
     def set_label_cache(self, labels: dict[str, str]) -> None:
         """
@@ -2249,19 +2297,26 @@ class WikidataDumpImporter:
         self._label_cache.update(labels)
         logger.info(f"Seeded label cache with {len(labels)} existing labels")
 
-    def get_new_labels_since(self, known_qids: set[str]) -> dict[str, str]:
+    def get_new_labels_since(self, known_qids: set[str] | None = None) -> dict[str, str]:
         """
-        Get labels that were added to cache since a known set.
+        Get labels added since last flush (or since known set).
+
+        Uses the efficient _new_labels tracking dict instead of scanning
+        the entire label cache. Call flush_new_labels() after persisting.
 
         Args:
-            known_qids: Set of QIDs that were already known
+            known_qids: Deprecated, ignored. Kept for backwards compatibility.
 
         Returns:
             Dict of new QID -> label mappings
         """
-        # Snapshot to avoid RuntimeError from concurrent reader thread mutations
-        items = list(self._label_cache.items())
-        return {qid: label for qid, label in items if qid not in known_qids}
+        # Snapshot the _new_labels dict (much smaller than full cache)
+        result = dict(self._new_labels)
+        return result
+
+    def flush_new_labels(self) -> None:
+        """Clear the new-labels tracker after persisting to DB."""
+        self._new_labels.clear()
 
     def _cache_entity_label(self, entity: dict) -> None:
         """
@@ -2278,6 +2333,39 @@ class WikidataDumpImporter:
         en_label = labels.get("en", {}).get("value", "")
         if en_label:
             self._label_cache[qid] = en_label
+            self._new_labels[qid] = en_label
+
+    def _cache_position_jurisdiction(self, entity: dict) -> None:
+        """
+        Cache P1001 (applies to jurisdiction) or P17 (country) for position items.
+
+        This enables backfilling org context for P39 claims where the position
+        item inherently implies a jurisdiction (e.g. Q11696 "President of the
+        United States" → Q30 "United States") but has no qualifier-level org.
+
+        Only caches entities that have P1001 or P17 — the check is trivially
+        cheap for entities that don't.
+        """
+        claims = entity.get("claims", {})
+        # Only bother if the entity has P1001 or P17
+        p1001_claims = claims.get("P1001", [])
+        p17_claims = claims.get("P17", [])
+        if not p1001_claims and not p17_claims:
+            return
+
+        qid = entity.get("id", "")
+        if not qid:
+            return
+
+        # Prefer P1001 (applies to jurisdiction), fall back to P17 (country)
+        for claim_list in (p1001_claims, p17_claims):
+            for claim in claim_list:
+                mainsnak = claim.get("mainsnak", {})
+                value = mainsnak.get("datavalue", {}).get("value", {})
+                jur_qid = value.get("id") if isinstance(value, dict) else None
+                if jur_qid:
+                    self._position_jurisdictions[qid] = jur_qid
+                    return
 
     def _resolve_qid(self, qid: str) -> str:
         """

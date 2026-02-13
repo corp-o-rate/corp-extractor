@@ -119,13 +119,6 @@ class ExtractRequest(BaseModel):
     text: str
 
 
-class ExtractResponse(BaseModel):
-    output: str
-    success: bool
-    cached: bool = False
-    error: Optional[str] = None
-
-
 def get_cache_key(text: str) -> str:
     """Generate a cache key from input text."""
     return hashlib.sha256(text.encode()).hexdigest()
@@ -164,11 +157,12 @@ def load_extractor(model_path: str) -> None:
     logger.info(f"Extractor loaded on device: {extractor.device}")
 
 
-def extract_with_cache(text: str) -> tuple[str, bool]:
+def extract_with_cache(text: str) -> tuple[dict, bool]:
     """
     Extract statements from text with caching.
-    Returns (result, cached) tuple.
+    Returns (result_dict, cached) tuple where result_dict is ExtractionResult.model_dump().
     """
+    import json as _json
     global cache_size_bytes
 
     # Check cache first
@@ -176,7 +170,7 @@ def extract_with_cache(text: str) -> tuple[str, bool]:
     if cache_key in result_cache:
         result_cache.move_to_end(cache_key)
         logger.info(f"Cache hit for key: {cache_key[:16]}...")
-        return result_cache[cache_key], True
+        return _json.loads(result_cache[cache_key]), True
 
     # Configure extraction options
     options = ExtractionOptions(
@@ -186,16 +180,18 @@ def extract_with_cache(text: str) -> tuple[str, bool]:
     )
 
     # Extract using the library
-    result = extractor.extract_as_xml(text, options)
+    result = extractor.extract(text, options)
+    result_dict = result.model_dump()
 
-    # Store in cache
-    entry_size = get_entry_size(cache_key, result)
+    # Store in cache (as JSON string)
+    result_json = _json.dumps(result_dict)
+    entry_size = get_entry_size(cache_key, result_json)
     evict_if_needed(entry_size)
-    result_cache[cache_key] = result
+    result_cache[cache_key] = result_json
     cache_size_bytes += entry_size
     logger.info(f"Cached result for key: {cache_key[:16]}... (entries: {len(result_cache)}, size: {cache_size_bytes / 1024 / 1024:.1f}MB)")
 
-    return result, False
+    return result_dict, False
 
 
 @app.get("/")
@@ -211,9 +207,9 @@ async def root():
     }
 
 
-@app.post("/extract", response_model=ExtractResponse)
+@app.post("/extract")
 async def extract_statements_endpoint(request: ExtractRequest):
-    """Extract statements from text."""
+    """Extract statements from text. Returns ExtractionResult model_dump format."""
     if extractor is None:
         raise HTTPException(status_code=503, detail="Extractor not loaded")
 
@@ -228,15 +224,15 @@ async def extract_statements_endpoint(request: ExtractRequest):
 
         logger.info(f"Processing text of length {len(text)}")
 
-        result, cached = extract_with_cache(text)
+        result_dict, cached = extract_with_cache(text)
 
-        logger.info(f"Generated output of length {len(result)} (cached: {cached})")
+        logger.info(f"Generated {len(result_dict.get('statements', []))} statements (cached: {cached})")
 
-        return ExtractResponse(output=result, success=True, cached=cached)
+        return {**result_dict, "cached": cached}
 
     except Exception as e:
         logger.error(f"Error during extraction: {e}")
-        return ExtractResponse(output="", success=False, error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.delete("/cache")

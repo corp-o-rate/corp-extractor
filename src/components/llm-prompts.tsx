@@ -101,6 +101,29 @@ for text in texts:
     result = extractor.extract(text)
 \`\`\`
 
+## Persistent Server (v0.9.7)
+
+For repeated extractions, start a persistent server to avoid model reload:
+
+\`\`\`bash
+corp-extractor serve                    # Start on localhost:8111
+corp-extractor --server pipeline "text" # Delegate to server
+export CORP_EXTRACTOR_SERVER=http://localhost:8111  # Or set env var
+\`\`\`
+
+## Python API Server Delegation (v0.9.8)
+
+Pass \`server_url\` to delegate processing to a running server from Python code:
+
+\`\`\`python
+from statement_extractor import extract_statements
+result = extract_statements("text", server_url="http://localhost:8111")
+
+from statement_extractor.pipeline import ExtractionPipeline
+pipeline = ExtractionPipeline(server_url="http://localhost:8111")
+ctx = pipeline.process("text")
+\`\`\`
+
 ## Best Practices
 
 1. Use \`[embeddings]\` extra for semantic deduplication
@@ -108,6 +131,8 @@ for text in texts:
 3. Use predicate taxonomies for consistent knowledge graphs
 4. Process large documents in chunks (by paragraph/section)
 5. GPU recommended for production (~2GB VRAM needed)
+6. Use \`corp-extractor serve\` for repeated CLI use to avoid startup cost
+7. Use \`server_url\` to delegate from Python without a local GPU
 
 ## Links
 

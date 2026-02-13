@@ -81,6 +81,10 @@ for stmt in statements:
 
 **v0.9.6 features**: Database v3 — lite databases drop all embedding tables (use USearch indexes for search). `db download`/`db upload` now include USearch `.bin` files. New `db_info` metadata table with `schema_version`. Global `--db-version` CLI flag for backwards compatibility. Filenames: `entities-v3.db` / `entities-v3-lite.db`.
 
+**v0.9.7 features**: Persistent local server (`corp-extractor serve`) keeps models warm in memory for fast repeated CLI use. New `--server` / `--server-url` flags and `CORP_EXTRACTOR_SERVER` env var to delegate processing to a running server instance.
+
+**v0.9.8 features**: Python API server delegation — pass `server_url` to `extract_statements()`, `ExtractionPipeline`, or `DocumentPipeline` to delegate processing to a running server from Python code. No local GPU required. All backends now return standardized Pydantic `model_dump()` JSON.
+
 ### Pipeline Quick Start (v0.5.0)
 
 For full entity resolution with qualification, canonicalization, labeling, and taxonomy classification:

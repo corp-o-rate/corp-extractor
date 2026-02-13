@@ -70,13 +70,22 @@ curl -X POST https://api.runpod.ai/v2/YOUR_ENDPOINT_ID/runsync \
   -d '{"input": {"text": "<page>Apple Inc. announced a commitment to carbon neutrality by 2030.</page>"}}'
 ```
 
-Expected response:
+Expected response (Pydantic `model_dump()` format):
 ```json
 {
   "id": "xxx",
   "status": "COMPLETED",
   "output": {
-    "output": "<statements><stmt>...</stmt></statements>"
+    "statements": [
+      {
+        "subject": {"text": "Apple Inc.", "type": "ORG"},
+        "predicate": "committed to",
+        "object": {"text": "carbon neutrality by 2030", "type": "EVENT"},
+        "source_text": "Apple Inc. announced a commitment to carbon neutrality by 2030.",
+        "confidence_score": 0.85
+      }
+    ],
+    "source_text": "<page>Apple Inc. announced a commitment to carbon neutrality by 2030.</page>"
   }
 }
 ```

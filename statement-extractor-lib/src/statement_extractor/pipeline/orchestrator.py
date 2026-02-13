@@ -38,14 +38,16 @@ class ExtractionPipeline:
     5. Taxonomy: Statement → TaxonomyResult (using taxonomy plugins)
     """
 
-    def __init__(self, config: Optional[PipelineConfig] = None):
+    def __init__(self, config: Optional[PipelineConfig] = None, server_url: Optional[str] = None):
         """
         Initialize the pipeline.
 
         Args:
             config: Pipeline configuration (uses defaults if not provided)
+            server_url: If provided, delegate processing to a running server
         """
         self.config = config or PipelineConfig.default()
+        self._server_url = server_url
 
     def process(
         self,
@@ -62,6 +64,11 @@ class ExtractionPipeline:
         Returns:
             PipelineContext with accumulated results from all stages
         """
+        if self._server_url:
+            from ..client import server_pipeline
+            config_dict = self._config_to_dict()
+            return server_pipeline(self._server_url, text, config_dict)
+
         # Merge config options into metadata for plugins
         combined_metadata = metadata.copy() if metadata else {}
 
@@ -113,6 +120,22 @@ class ExtractionPipeline:
         )
 
         return ctx
+
+    def _config_to_dict(self) -> dict[str, Any]:
+        """Serialize PipelineConfig to the dict format the server expects."""
+        d: dict[str, Any] = {}
+        if self.config.enabled_stages:
+            d["enabled_stages"] = sorted(self.config.enabled_stages)
+        if self.config.disabled_plugins:
+            d["disabled_plugins"] = sorted(self.config.disabled_plugins)
+        if self.config.enabled_plugins:
+            d["enabled_plugins"] = sorted(self.config.enabled_plugins)
+        for key in ("extractor_options", "splitter_options", "qualifier_options",
+                    "labeler_options", "taxonomy_options"):
+            val = getattr(self.config, key, None)
+            if val:
+                d[key] = val
+        return d
 
     def _run_splitting(self, ctx: PipelineContext) -> PipelineContext:
         """Stage 1: Split text into atomic sentences."""
