@@ -45,12 +45,18 @@ uv sync                        # Install Python dependencies
 uv run python server.py        # Start FastAPI server at localhost:8000
 ```
 
-### RunPod Deployment
+### Cerebrium Deployment
 ```bash
-cd runpod
-# Build for Linux/amd64 (required on Mac)
-docker build --platform linux/amd64 -t statement-extractor-runpod .
+cd cerebrium
+# Deploy into the SAME Cerebrium project as corp-entity-db so the
+# /persistent-storage volume (entities-v6.db, USearch indexes, embeddinggemma)
+# is shared. Set HF_TOKEN secret for gated models before first deploy.
+cerebrium projects current                    # confirm correct project
+cerebrium secrets set HF_TOKEN <token>
+cerebrium deploy
+cerebrium logs statement-extractor --follow
 ```
+See `cerebrium/README.md` for full deployment notes.
 
 ### Upload Model to HuggingFace
 ```bash
@@ -80,17 +86,17 @@ corp-extractor --server-url http://gpu:8111 split "text" # Custom server URL
 
 ## Architecture
 
-### Three Deployment Modes
-The frontend can connect to the model via three backends (configured by environment variables):
-1. **RunPod Serverless** (`RUNPOD_ENDPOINT_ID`, `RUNPOD_API_KEY`) - Production, pay-per-use GPU
-2. **Local Server** (`LOCAL_MODEL_URL`) - Self-hosted FastAPI server
-3. **HuggingFace Inference** - Fallback, rate-limited
+### Deployment Modes
+The frontend can connect to the model via two backends (configured by environment variables):
+1. **Cerebrium Serverless** (`CEREBRIUM_EXTRACT_URL`, `CEREBRIUM_EXTRACT_URL_URL`, `CEREBRIUM_TOKEN`) - Production, pay-per-use GPU. Synchronous request/response with one-shot retry on Vercel timeout (`maxDuration=300`). Replica is pre-warmed by a localStorage-gated browser ping on page load (TTL 1h). Deployed into the same Cerebrium project as `corp-entity-db` so `/persistent-storage` (entity DB + USearch indexes + embeddinggemma model) is shared.
+2. **Local Server** (`LOCAL_MODEL_URL`) - Self-hosted FastAPI server.
 
 ### Directory Structure
 - `src/` - Next.js frontend (React 19, Tailwind CSS, D3.js for graph visualization)
-- `src/app/api/extract/` - API route that proxies to model backends
+- `src/app/api/extract/` - API route that proxies to model backends (sync, with retry on cold-boot timeout)
+- `cerebrium/` - Cerebrium app (`main.py` + `cerebrium.toml`) — replaces the old runpod/ deployment
 - `local-server/` - FastAPI server for local model inference (uv-managed)
-- `runpod/` - Docker + handler for RunPod serverless deployment
+- `runpod/` - Legacy RunPod handler. Superseded by `cerebrium/`; retained for reference.
 - `scripts/` - HuggingFace upload utilities (uv-managed)
 - `statement-extractor-lib/` - Python library for statement extraction (PyPI package)
 
@@ -102,7 +108,8 @@ The frontend can connect to the model via three backends (configured by environm
 ### Key Technical Notes
 - Uses [Diverse Beam Search](https://arxiv.org/abs/1610.02424) (Vijayakumar et al., 2016) for high-quality extraction
 - T5Gemma2 requires `transformers` dev version from GitHub (not PyPI)
-- RunPod requires `--platform linux/amd64` when building Docker on Mac
+- Cerebrium app shares `/persistent-storage` with the `corp-entity-db` app in the same project; `cerebrium/main.py` redirects `HF_HOME` and `statement_extractor.database.hub.DEFAULT_CACHE_DIR` to the volume so entity DB + embeddinggemma weights are reused as-is
+- Legacy RunPod build required `--platform linux/amd64` when building Docker on Mac (kept in `runpod/` for reference)
 - Model uses bfloat16 on GPU, float32 on CPU
 - Generation stops at `</statements>` tag to prevent runaway output
 - **v0.9.8**: Python API server delegation via `server_url=` parameter on `extract_statements()`, `ExtractionPipeline`, and `DocumentPipeline`. New `client.py` module handles HTTP delegation and Pydantic model reconstruction. All backends (server, RunPod, local-server) now return standardized `model_dump()` format — no more XML strings or custom wrappers. CLI reconstructs full Pydantic models from server JSON, eliminating duplicate formatting code.

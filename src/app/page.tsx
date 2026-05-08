@@ -10,7 +10,7 @@ import { RelationshipGraph } from '@/components/relationship-graph';
 import { RateLimitBanner } from '@/components/rate-limit-banner';
 import { QuickStart } from '@/components/documentation';
 import { LLMPrompts } from '@/components/llm-prompts';
-import { ExtractionResult, Statement, JobSubmissionResponse, JobStatusResponse, UrlJobSubmissionResponse, UrlExtractionResult } from '@/lib/types';
+import { ExtractionResult, Statement, UrlExtractionResult } from '@/lib/types';
 import { getUserUuid } from '@/lib/user-uuid';
 import { toast } from 'sonner';
 import { ExportFormats } from '@/components/export-formats';
@@ -20,10 +20,11 @@ import { CanonicalPredicates } from '@/components/canonical-predicates';
 import { StatementTaxonomy } from '@/components/statement-taxonomy';
 import { WarmUpDialog } from '@/components/warm-up-dialog';
 
-// Polling interval in milliseconds
-const POLL_INTERVAL = 5000;
-// Show warm-up dialog after this many seconds
+// Show warm-up dialog after this many seconds of in-flight extraction
 const WARMUP_DIALOG_THRESHOLD = 30;
+// Pre-warm the Cerebrium replica at most once per hour per browser.
+const PREWARM_KEY = 'corp-extractor:lastPrewarm';
+const PREWARM_TTL_MS = 60 * 60 * 1000;
 
 export default function Home() {
   const [statements, setStatements] = useState<Statement[]>([]);
@@ -46,32 +47,32 @@ export default function Home() {
     setUserUuid(getUserUuid());
   }, []);
 
+  // Pre-warm the Cerebrium replica on load if we haven't in the last hour.
+  // First cold-start (model download into /persistent-storage) can take
+  // minutes; firing a dummy /api/extract from the browser means the replica
+  // is usually warm by the time the user submits a real query.
+  useEffect(() => {
+    try {
+      const last = Number(localStorage.getItem(PREWARM_KEY) ?? 0);
+      if (Date.now() - last < PREWARM_TTL_MS) return;
+      localStorage.setItem(PREWARM_KEY, String(Date.now()));
+    } catch {
+      return;
+    }
+    fetch('/api/extract', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: 'warmup' }),
+      keepalive: true,
+    }).catch(() => {});
+  }, []);
+
   // Show warm-up dialog after threshold seconds of loading
   useEffect(() => {
     if (isLoading && elapsedSeconds >= WARMUP_DIALOG_THRESHOLD && !warmUpDialogDismissed) {
       setShowWarmUpDialog(true);
     }
   }, [isLoading, elapsedSeconds, warmUpDialogDismissed]);
-
-  const pollJobStatus = async (
-    jobId: string,
-    inputTextForCache?: string,
-    useCanonicalPredicates?: boolean
-  ): Promise<JobStatusResponse> => {
-    const params = new URLSearchParams({ jobId });
-    if (inputTextForCache) {
-      params.set('inputText', inputTextForCache);
-    }
-    if (useCanonicalPredicates) {
-      params.set('useCanonicalPredicates', 'true');
-    }
-    const response = await fetch(`/api/extract/status?${params.toString()}`);
-    if (!response.ok) {
-      const error = await response.json();
-      throw new Error(error.error || 'Failed to check job status');
-    }
-    return response.json();
-  };
 
   const handleExtract = async (input: ExtractionInput) => {
     setIsLoading(true);
@@ -106,101 +107,42 @@ export default function Home() {
         throw new Error(error.error || 'Failed to extract statements');
       }
 
-      const result = await response.json();
+      // Cerebrium runs synchronously; the API route returns the full payload.
+      // For URL extraction the payload is shaped like UrlExtractionResult
+      // (statements + metadata + summary); for text it's an ExtractionResult.
+      const result = (await response.json()) as ExtractionResult & Partial<UrlExtractionResult>;
 
-      // Check if this is a URL job submission
-      if (result.isUrlJob && result.jobId) {
-        const urlJobSubmission = result as UrlJobSubmissionResponse;
-        console.log(`URL job submitted: ${urlJobSubmission.jobId}`);
+      const statements = result.statements || [];
+      setStatements(statements);
+      setEditedStatements(JSON.parse(JSON.stringify(statements)));
+      setHasChanges(false);
+      setIsEditMode(false);
 
-        let statusResult: JobStatusResponse;
-        do {
-          await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL));
-          statusResult = await pollJobStatus(urlJobSubmission.jobId);
-          console.log(`Job status: ${statusResult.status}`);
-        } while (statusResult.status === 'IN_QUEUE' || statusResult.status === 'IN_PROGRESS');
-
-        if (statusResult.status === 'FAILED') {
-          throw new Error(statusResult.error || 'Job failed');
-        }
-
-        if (statusResult.status === 'TIMED_OUT') {
-          clearInterval(timerInterval);
-          setIsLoading(false);
-          setShowWarmUpDialog(false);
-          setShowTimeoutDialog(true);
-          return;
-        }
-
-        // URL job completed
-        const statements = statusResult.statements || [];
-        setStatements(statements);
-        setEditedStatements(JSON.parse(JSON.stringify(statements)));
-        setHasChanges(false);
-        setIsEditMode(false);
-
-        if (statements.length === 0) {
-          toast.info('No statements found in the document');
-        } else {
-          toast.success(`Extracted ${statements.length} statement${statements.length !== 1 ? 's' : ''} from document`);
-        }
-      } else if (result.jobId) {
-        // Text job - poll for result
-        const jobSubmission = result as JobSubmissionResponse;
-        console.log(`Job submitted: ${jobSubmission.jobId}`);
-
-        let statusResult: JobStatusResponse;
-        do {
-          await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL));
-          statusResult = await pollJobStatus(jobSubmission.jobId, input.text, input.useCanonicalPredicates);
-          console.log(`Job status: ${statusResult.status}`);
-        } while (statusResult.status === 'IN_QUEUE' || statusResult.status === 'IN_PROGRESS');
-
-        if (statusResult.status === 'FAILED') {
-          throw new Error(statusResult.error || 'Job failed');
-        }
-
-        if (statusResult.status === 'TIMED_OUT') {
-          // Show timeout dialog instead of error toast
-          clearInterval(timerInterval);
-          setIsLoading(false);
-          setShowWarmUpDialog(false);
-          setShowTimeoutDialog(true);
-          return; // Exit early - don't cache, don't show error toast
-        }
-
-        // Job completed
-        const statements = statusResult.statements || [];
-        setStatements(statements);
-        setEditedStatements(JSON.parse(JSON.stringify(statements)));
-        setHasChanges(false);
-        setIsEditMode(false);
-
-        if (statements.length === 0) {
-          toast.info('No statements found in the text');
-        } else {
-          toast.success(`Extracted ${statements.length} statement${statements.length !== 1 ? 's' : ''}`);
-        }
+      if (result.cached && result.message) {
+        setRateLimitMessage(result.message);
+        toast.warning(result.message);
+      } else if (statements.length === 0) {
+        toast.info(input.mode === 'url' ? 'No statements found in the document' : 'No statements found in the text');
       } else {
-        // Immediate result (local model or cached)
-        const extractionResult = result as ExtractionResult;
-        setStatements(extractionResult.statements);
-        setEditedStatements(JSON.parse(JSON.stringify(extractionResult.statements)));
-        setHasChanges(false);
-        setIsEditMode(false);
-
-        if (extractionResult.cached && extractionResult.message) {
-          setRateLimitMessage(extractionResult.message);
-          toast.warning(extractionResult.message);
-        } else if (extractionResult.statements.length === 0) {
-          toast.info('No statements found in the text');
-        } else {
-          toast.success(`Extracted ${extractionResult.statements.length} statement${extractionResult.statements.length !== 1 ? 's' : ''}`);
-        }
+        const suffix = input.mode === 'url' ? ' from document' : '';
+        toast.success(`Extracted ${statements.length} statement${statements.length !== 1 ? 's' : ''}${suffix}`);
       }
     } catch (error) {
       console.error('Extraction error:', error);
-      toast.error(error instanceof Error ? error.message : 'Failed to extract statements');
+      // A network-level abort/timeout (Vercel killed the function, or the
+      // browser timed out) gets surfaced as the timeout dialog rather than a
+      // bare toast — usually means the cold-start retry didn't land.
+      const message = error instanceof Error ? error.message : 'Failed to extract statements';
+      const looksLikeTimeout = /timeout|abort|504|gateway/i.test(message);
+      if (looksLikeTimeout) {
+        clearInterval(timerInterval);
+        setIsLoading(false);
+        setElapsedSeconds(0);
+        setShowWarmUpDialog(false);
+        setShowTimeoutDialog(true);
+        return;
+      }
+      toast.error(message);
     } finally {
       clearInterval(timerInterval);
       setIsLoading(false);

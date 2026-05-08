@@ -1,43 +1,100 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { parseStatements } from '@/lib/statement-parser';
 import { CACHED_EXAMPLE } from '@/lib/cached-example';
-import { ExtractionResult, UrlExtractionResult } from '@/lib/types';
-import { getCachedStatements } from '@/lib/cache';
+import { ExtractionResult } from '@/lib/types';
+import { getCachedStatements, setCachedStatements } from '@/lib/cache';
 
-// Environment configuration
-const RUNPOD_ENDPOINT_ID = process.env.RUNPOD_ENDPOINT_ID;
-const RUNPOD_API_KEY = process.env.RUNPOD_API_KEY;
+// Cold-boot of a Cerebrium replica (T5-Gemma2 + GLiNER2 + GGUF qualifier
+// loading from /persistent-storage) can take several minutes on the very
+// first hit after scale-to-zero. Vercel hobby caps function duration at
+// 300s; we use the full window and rely on a one-shot retry below to land
+// the second attempt on a now-warm replica.
+export const maxDuration = 300;
+
+const CEREBRIUM_EXTRACT_URL = process.env.CEREBRIUM_EXTRACT_URL;
+const CEREBRIUM_EXTRACT_URL_URL = process.env.CEREBRIUM_EXTRACT_URL_URL;
+const CEREBRIUM_TOKEN = process.env.CEREBRIUM_TOKEN;
 const LOCAL_MODEL_URL = process.env.LOCAL_MODEL_URL;
+
+// Per-attempt client-side timeout. We give the first attempt 240s so a
+// retry has ~60s to land if the first aborts. If neither attempt finishes
+// within the 300s function budget, Vercel kills the request and the
+// frontend's warmup ping (page.tsx) will have spun the replica up by the
+// next user action.
+const FIRST_ATTEMPT_TIMEOUT_MS = 240_000;
+const RETRY_ATTEMPT_TIMEOUT_MS = 50_000;
+
+interface CerebriumEnvelope {
+  run_id?: string;
+  result?: unknown;
+  run_time_ms?: number;
+}
+
+async function callCerebrium(endpointUrl: string, body: object, timeoutMs: number): Promise<unknown> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(endpointUrl, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${CEREBRIUM_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Cerebrium error: status=${response.status}, body=${errorText.slice(0, 500)}`);
+    }
+    const envelope = (await response.json()) as CerebriumEnvelope;
+    return envelope.result ?? envelope;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function callCerebriumWithRetry(endpointUrl: string, body: object): Promise<unknown> {
+  // First attempt — likely lands on a cold replica if no recent traffic.
+  try {
+    return await callCerebrium(endpointUrl, body, FIRST_ATTEMPT_TIMEOUT_MS);
+  } catch (firstError) {
+    const isAbort = firstError instanceof Error && firstError.name === 'AbortError';
+    console.warn(
+      `Cerebrium first attempt failed (${isAbort ? 'timeout' : 'error'}):`,
+      firstError instanceof Error ? firstError.message : firstError,
+    );
+    // Retry once. The cold-start should have triggered the replica to spin
+    // up during the first attempt, so the second hit usually returns fast.
+    return await callCerebrium(endpointUrl, body, RETRY_ATTEMPT_TIMEOUT_MS);
+  }
+}
 
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
     const { text, url, useCanonicalPredicates, useOcr, maxTokens, overlapTokens } = body;
 
-    // Handle URL input
     if (url) {
       return handleUrlExtraction(url, { useOcr, maxTokens, overlapTokens });
     }
 
     if (!text || typeof text !== 'string') {
-      return NextResponse.json(
-        { error: 'Missing or invalid text field' },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: 'Missing or invalid text field' }, { status: 400 });
     }
 
     if (text.length > 10000) {
       return NextResponse.json(
         { error: 'Text too long. Maximum 10,000 characters.' },
-        { status: 400 }
+        { status: 400 },
       );
     }
 
-    // Wrap text in page tags as expected by the model
+    // Wrap text in <page> tags as expected by the model.
     const modelInput = `<page>${text}</page>`;
 
-    // Check cache first (for RunPod requests)
-    if (RUNPOD_ENDPOINT_ID && RUNPOD_API_KEY) {
+    // Supabase result cache (separate from Cerebrium's in-memory cache).
+    if (CEREBRIUM_EXTRACT_URL && CEREBRIUM_TOKEN) {
       const cachedStatements = await getCachedStatements(text, { useCanonicalPredicates });
       if (cachedStatements) {
         console.log('Returning cached result');
@@ -50,55 +107,41 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    // Try RunPod first (primary production option) - use async /run endpoint
-    if (RUNPOD_ENDPOINT_ID && RUNPOD_API_KEY) {
+    // Cerebrium (primary production backend).
+    if (CEREBRIUM_EXTRACT_URL && CEREBRIUM_TOKEN) {
       try {
-        console.log(`Submitting job to RunPod endpoint: ${RUNPOD_ENDPOINT_ID}`);
+        console.log(`Calling Cerebrium /extract: textLen=${text.length}`);
+        const payload = (await callCerebriumWithRetry(CEREBRIUM_EXTRACT_URL, {
+          text: modelInput,
+          useCanonicalPredicates: !!useCanonicalPredicates,
+          similarityThreshold: 0.5,
+        })) as { statements?: unknown; cached?: boolean } | string;
 
-        const runpodResponse = await fetch(
-          `https://api.runpod.ai/v2/${RUNPOD_ENDPOINT_ID}/run`,
-          {
-            method: 'POST',
-            headers: {
-              'Authorization': `Bearer ${RUNPOD_API_KEY}`,
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              input: {
-                text: modelInput,
-                format: 'json', // Request JSON format for v0.2.0+ (includes confidence scores)
-                useCanonicalPredicates: useCanonicalPredicates || false,
-              },
-            }),
-          }
-        );
+        const statements = parseStatements(payload as Parameters<typeof parseStatements>[0]);
 
-        if (runpodResponse.ok) {
-          const data = await runpodResponse.json();
-          console.log(`RunPod job submitted: ${data.id}, status: ${data.status}`);
-
-          // Return job ID for polling
-          return NextResponse.json({
-            jobId: data.id,
-            status: data.status,
-            inputText: text,
-          });
-        } else {
-          const errorText = await runpodResponse.text();
-          console.error(`RunPod API error: status=${runpodResponse.status}, body=${errorText}`);
-          throw new Error(`RunPod API error: ${runpodResponse.status}`);
+        // Best-effort persist to Supabase cache (non-fatal).
+        if (statements.length > 0) {
+          await setCachedStatements(text, statements, { useCanonicalPredicates }).catch(() => {});
         }
-      } catch (runpodError) {
-        console.warn('RunPod unavailable:', runpodError);
-        // Fall through to next option
+
+        const result: ExtractionResult = {
+          statements,
+          cached: typeof payload === 'object' && payload !== null && 'cached' in payload
+            ? !!(payload as { cached?: boolean }).cached
+            : false,
+          inputText: text,
+        };
+        return NextResponse.json(result);
+      } catch (cerebriumError) {
+        console.warn('Cerebrium unavailable:', cerebriumError);
+        // Fall through to local model / cached example.
       }
     }
 
-    // Try local model if configured (returns result directly, no polling needed)
+    // Local model fallback for development.
     if (LOCAL_MODEL_URL) {
       try {
         console.log(`Calling local model: ${LOCAL_MODEL_URL}`);
-
         const localResponse = await fetch(`${LOCAL_MODEL_URL}/extract`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -107,16 +150,12 @@ export async function POST(request: NextRequest) {
 
         if (localResponse.ok) {
           const data = await localResponse.json();
-          // New format: ExtractionResult model_dump {statements: [...], source_text, cached}
-          // Also support legacy format: {output: "xml string", success: true}
           const statements = parseStatements(data.output || data);
-
           const result: ExtractionResult = {
             statements,
             cached: data.cached || false,
             inputText: text,
           };
-
           return NextResponse.json(result);
         }
       } catch (localError) {
@@ -124,93 +163,80 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    // No model available, return cached example
+    // No backend available — return cached example with a notice.
     console.log('No model endpoint configured, returning cached example');
     return NextResponse.json({
       ...CACHED_EXAMPLE,
-      message: 'No model endpoint configured. Showing cached example. See documentation to run locally or deploy to RunPod.',
+      message:
+        'No model endpoint configured. Showing cached example. See documentation to run locally or deploy to Cerebrium.',
     });
-
   } catch (error) {
     console.error('Extract API error:', error);
-    return NextResponse.json(
-      { error: 'Internal server error' },
-      { status: 500 }
-    );
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }
 }
 
 async function handleUrlExtraction(
   url: string,
-  options: { useOcr?: boolean; maxTokens?: number; overlapTokens?: number }
+  options: { useOcr?: boolean; maxTokens?: number; overlapTokens?: number },
 ) {
-  // Validate URL
   try {
     new URL(url);
   } catch {
-    return NextResponse.json(
-      { error: 'Invalid URL provided' },
-      { status: 400 }
-    );
+    return NextResponse.json({ error: 'Invalid URL provided' }, { status: 400 });
   }
 
-  // Only allow http/https
   if (!url.startsWith('http://') && !url.startsWith('https://')) {
     return NextResponse.json(
       { error: 'URL must start with http:// or https://' },
-      { status: 400 }
+      { status: 400 },
     );
   }
 
-  // Try RunPod first (primary production option) - use async /run endpoint
-  if (RUNPOD_ENDPOINT_ID && RUNPOD_API_KEY) {
+  if (CEREBRIUM_EXTRACT_URL_URL && CEREBRIUM_TOKEN) {
     try {
-      console.log(`Submitting URL job to RunPod endpoint: ${RUNPOD_ENDPOINT_ID}`);
+      console.log(`Calling Cerebrium /extract_url: ${url}`);
+      const payload = (await callCerebriumWithRetry(CEREBRIUM_EXTRACT_URL_URL, {
+        url,
+        useOcr: options.useOcr || false,
+        maxTokens: options.maxTokens || 1000,
+        overlapTokens: options.overlapTokens || 100,
+      })) as Record<string, unknown>;
 
-      const runpodResponse = await fetch(
-        `https://api.runpod.ai/v2/${RUNPOD_ENDPOINT_ID}/run`,
+      // The handler returns a DocumentContext model_dump — `statements` is
+      // present at the top level alongside metadata/summary, so it parses as
+      // a LibraryExtractionResult.
+      const statements = parseStatements(payload as unknown as Parameters<typeof parseStatements>[0]);
+      return NextResponse.json({
+        statements,
+        metadata: payload.metadata ?? {
+          url,
+          chunk_count: 0,
+          statement_count: statements.length,
+          duplicates_removed: 0,
+        },
+        summary: payload.summary,
+        cached: !!payload.cached,
+      });
+    } catch (cerebriumError) {
+      console.warn('Cerebrium unavailable for URL processing:', cerebriumError);
+      return NextResponse.json(
         {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${RUNPOD_API_KEY}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            input: {
-              url,
-              useOcr: options.useOcr || false,
-              maxTokens: options.maxTokens || 1000,
-              overlapTokens: options.overlapTokens || 100,
-            },
-          }),
-        }
+          error:
+            cerebriumError instanceof Error
+              ? cerebriumError.message
+              : 'Cerebrium error during URL processing',
+        },
+        { status: 502 },
       );
-
-      if (runpodResponse.ok) {
-        const data = await runpodResponse.json();
-        console.log(`RunPod URL job submitted: ${data.id}, status: ${data.status}`);
-
-        // Return job ID for polling
-        return NextResponse.json({
-          jobId: data.id,
-          status: data.status,
-          inputUrl: url,
-          isUrlJob: true,
-        });
-      } else {
-        const errorText = await runpodResponse.text();
-        console.error(`RunPod API error: status=${runpodResponse.status}, body=${errorText}`);
-        throw new Error(`RunPod API error: ${runpodResponse.status}`);
-      }
-    } catch (runpodError) {
-      console.warn('RunPod unavailable for URL processing:', runpodError);
-      // Fall through to error
     }
   }
 
-  // No model available for URL processing
   return NextResponse.json(
-    { error: 'URL processing requires RunPod endpoint. Configure RUNPOD_ENDPOINT_ID and RUNPOD_API_KEY.' },
-    { status: 503 }
+    {
+      error:
+        'URL processing requires Cerebrium. Configure CEREBRIUM_EXTRACT_URL_URL and CEREBRIUM_TOKEN.',
+    },
+    { status: 503 },
   );
 }

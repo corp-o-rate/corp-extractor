@@ -68,22 +68,7 @@ export interface ExtractionResult {
   inputText?: string;
 }
 
-// Job submission response (for async RunPod)
-export interface JobSubmissionResponse {
-  jobId: string;
-  status: 'IN_QUEUE' | 'IN_PROGRESS';
-  inputText: string;
-}
-
-// Job submission response for URL extraction
-export interface UrlJobSubmissionResponse {
-  jobId: string;
-  status: 'IN_QUEUE' | 'IN_PROGRESS';
-  inputUrl: string;
-  isUrlJob: true;
-}
-
-// URL extraction result with metadata
+// URL extraction result with metadata (returned by Cerebrium /extract_url).
 export interface UrlExtractionResult {
   statements: Statement[];
   metadata: {
@@ -95,14 +80,6 @@ export interface UrlExtractionResult {
   };
   summary?: string;
   cached?: boolean;
-}
-
-// Job status response
-export interface JobStatusResponse {
-  status: 'IN_QUEUE' | 'IN_PROGRESS' | 'COMPLETED' | 'FAILED' | 'TIMED_OUT';
-  statements?: Statement[];
-  cached?: boolean;
-  error?: string;
 }
 
 export interface GraphNode {

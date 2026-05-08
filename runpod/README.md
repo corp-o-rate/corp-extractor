@@ -1,4 +1,10 @@
-# RunPod Serverless Deployment
+# RunPod Serverless Deployment (legacy)
+
+> **Superseded by `cerebrium/`**. Production now runs on Cerebrium so the
+> deployment shares `/persistent-storage` with the corp-entity-db app
+> (entity DB + USearch indexes + embeddinggemma weights). This directory is
+> kept for reference and is no longer the active production path. See
+> `cerebrium/README.md`.
 
 Deploy the Statement Extractor model to RunPod Serverless for production use.
 

@@ -1,0 +1,60 @@
+# Cerebrium app config for statement-extractor demo.
+# Replaces runpod/handler.py; deployed into the SAME Cerebrium project as
+# corp-entity-db so both apps share /persistent-storage in us-east-1.
+#
+# Endpoint URLs after deploy:
+#   POST https://api.cortex.cerebrium.ai/v4/<project-id>/statement-extractor/extract
+#   POST https://api.cortex.cerebrium.ai/v4/<project-id>/statement-extractor/extract_url
+#
+# The volume already holds the corp-entity-db data (entities-v6.db, USearch
+# indexes, embeddinggemma-300m). On first request this app additionally pulls:
+#   - Corp-o-Rate-Community/statement-extractor (T5-Gemma2, ~20 GB)
+#   - google/gemma-3-12b-it-qat-q4_0-gguf      (~7 GB)
+#   - fastino/gliner2-base-v1                   (~1 GB)
+# So make sure the project volume has ~40 GB free before first deploy
+# (resize via the REST API in the cerebrium skill if needed).
+
+[cerebrium.deployment]
+name = "statement-extractor"
+python_version = "3.11"
+include = ["./main.py", "./cerebrium.toml"]
+exclude = [".git/*", "__pycache__/*", "*.pyc", ".pytest_cache/*"]
+docker_base_image_url = "nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04"
+
+[cerebrium.hardware]
+# A100 to start (T5-Gemma2 in bf16 ~20 GB + GLiNER2 + embedders + headroom).
+# Downgrade to ADA_L4 (24 GB) once the working set is profiled — the GGUF
+# qualifier runs on CPU via llama-cpp-python so VRAM pressure is just T5-Gemma.
+compute = "AMPERE_A100"
+gpu_count = 1
+cpu = 8
+memory = 32
+provider = "aws"
+region = "us-east-1"
+
+[cerebrium.scaling]
+min_replicas = 0
+max_replicas = 1
+cooldown = 60
+replica_concurrency = 1
+response_grace_period = 3600
+
+[cerebrium.dependencies.pip]
+"corp-extractor" = ">=0.9.8"
+accelerate = "latest"
+safetensors = "latest"
+sentencepiece = "latest"
+gliner2 = "latest"
+sentence-transformers = "latest"
+huggingface_hub = "latest"
+llama-cpp-python = "latest"
+# T5Gemma2 requires the dev version of transformers from GitHub (not PyPI).
+transformers = "git+https://github.com/huggingface/transformers.git"
+
+[cerebrium.dependencies.apt]
+# (none)
+
+# Required at runtime via cerebrium secrets:
+#   HF_TOKEN — for the gated google/embeddinggemma-300m and gemma-3-12b GGUF
+#              models, plus the statement-extractor T5-Gemma2 model.
+# Set with: cerebrium secrets set HF_TOKEN <token>
