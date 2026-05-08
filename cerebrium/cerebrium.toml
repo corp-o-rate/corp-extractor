@@ -41,16 +41,11 @@ replica_concurrency = 1
 response_grace_period = 3600
 
 [cerebrium.dependencies.pip]
+# corp-extractor's own pyproject pulls in transformers>=5.0.0rc3 (T5Gemma2
+# support landed in that RC), gliner2, accelerate, llama-cpp-python,
+# fastapi/uvicorn, and corp-entity-db. We don't re-declare those here so
+# pip's dependency resolver picks one consistent version set.
 "corp-extractor" = ">=0.9.8"
-accelerate = "latest"
-safetensors = "latest"
-sentencepiece = "latest"
-gliner2 = "latest"
-sentence-transformers = "latest"
-huggingface_hub = "latest"
-llama-cpp-python = "latest"
-# T5Gemma2 requires the dev version of transformers from GitHub (not PyPI).
-transformers = "git+https://github.com/huggingface/transformers.git"
 
 [cerebrium.dependencies.apt]
 # (none)
