@@ -22,10 +22,11 @@ exclude = [".git/*", "__pycache__/*", "*.pyc", ".pytest_cache/*"]
 docker_base_image_url = "nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04"
 
 [cerebrium.hardware]
-# A100 to start (T5-Gemma2 in bf16 ~20 GB + GLiNER2 + embedders + headroom).
-# Downgrade to ADA_L4 (24 GB) once the working set is profiled — the GGUF
-# qualifier runs on CPU via llama-cpp-python so VRAM pressure is just T5-Gemma.
-compute = "AMPERE_A100_40GB"
+# ADA_L40 (48 GB) — largest GPU available on the Cerebrium hobby plan.
+# T5-Gemma2 in bf16 (~20 GB) + GLiNER2 + embedders fits comfortably; the
+# Gemma-3-12B GGUF qualifier runs on CPU via llama-cpp-python so doesn't
+# share VRAM. Was AMPERE_A100_40GB but that requires a paid plan upgrade.
+compute = "ADA_L40"
 gpu_count = 1
 cpu = 8
 memory = 32
