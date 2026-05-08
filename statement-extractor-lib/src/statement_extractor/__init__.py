@@ -55,13 +55,6 @@ from .extractor import (
     extract_statements_as_xml,
 )
 
-# Canonicalization utilities
-from .canonicalization import (
-    Canonicalizer,
-    default_entity_canonicalizer,
-    deduplicate_statements_exact,
-)
-
 # Scoring utilities
 from .scoring import (
     BeamScorer,
@@ -90,10 +83,6 @@ __all__ = [
     "extract_statements_as_dict",
     "extract_statements_as_json",
     "extract_statements_as_xml",
-    # Canonicalization
-    "Canonicalizer",
-    "default_entity_canonicalizer",
-    "deduplicate_statements_exact",
     # Scoring
     "BeamScorer",
     "TripleScorer",

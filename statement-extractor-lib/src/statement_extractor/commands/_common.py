@@ -85,12 +85,12 @@ def _resolve_db_path(db_path: Optional[str] = None) -> Path:
     except RuntimeError:
         db_version = None
     if db_version is not None:
-        from ..database.hub import DEFAULT_CACHE_DIR, db_filenames
+        from corp_entity_db.hub import DEFAULT_CACHE_DIR, db_filenames
         full_fn, _, _ = db_filenames(db_version)
         return DEFAULT_CACHE_DIR / full_fn
     # Default: try v3, fall back to v2
-    from ..database.hub import DEFAULT_CACHE_DIR
-    from ..database.store import DEFAULT_DB_PATH
+    from corp_entity_db.hub import DEFAULT_CACHE_DIR
+    from corp_entity_db.store import DEFAULT_DB_PATH
     if DEFAULT_DB_PATH.exists():
         return DEFAULT_DB_PATH
     v2_path = DEFAULT_CACHE_DIR / "entities-v2.db"

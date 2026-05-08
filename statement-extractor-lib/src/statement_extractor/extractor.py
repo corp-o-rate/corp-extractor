@@ -494,14 +494,7 @@ class StatementExtractor:
                         logger.debug("Normalizing predicates to taxonomy...")
                         statements = comparer.normalize_predicates(statements)
             except Exception as e:
-                logger.warning(f"Embedding deduplication failed, falling back to exact match: {e}")
-                statements = self._deduplicate_statements_exact(statements, options)
-                logger.debug(f"  After exact dedup: {len(statements)} statements")
-        elif options.deduplicate:
-            logger.debug("Using exact text deduplication...")
-            pre_dedup_count = len(statements)
-            statements = self._deduplicate_statements_exact(statements, options)
-            logger.debug(f"  After exact dedup: {len(statements)} statements (removed {pre_dedup_count - len(statements)})")
+                logger.warning(f"Embedding deduplication failed: {e}")
         else:
             logger.debug("Deduplication disabled")
 
@@ -626,18 +619,6 @@ class StatementExtractor:
 
         # Select best result (longest, for backward compatibility)
         return max(all_results, key=lambda x: len(x[0]))[0]
-
-    def _deduplicate_statements_exact(
-        self,
-        statements: list[Statement],
-        options: ExtractionOptions,
-    ) -> list[Statement]:
-        """Deduplicate statements using exact text matching."""
-        from .canonicalization import deduplicate_statements_exact
-        return deduplicate_statements_exact(
-            statements,
-            entity_canonicalizer=options.entity_canonicalizer
-        )
 
     def _select_best_per_source(
         self,

@@ -25,7 +25,10 @@ def main(ctx: click.Context, db_version: int | None, use_server: bool, server_ur
         document   Process documents with chunking and citations
         serve      Start persistent local server (keeps models warm)
         plugins    List or inspect available plugins
-        db         Manage entity/organization embedding database
+
+    \b
+    Entity database management has moved to the corp-entity-db package.
+    Install it with: pip install corp-entity-db
 
     \b
     Examples:
@@ -50,11 +53,9 @@ from .pipeline import pipeline_cmd
 from .plugins import plugins_cmd
 from .serve import serve_cmd
 from .document import document_cmd
-from .db import db_cmd
 
 main.add_command(split_cmd)
 main.add_command(pipeline_cmd)
 main.add_command(plugins_cmd)
 main.add_command(serve_cmd)
 main.add_command(document_cmd)
-main.add_command(db_cmd)
