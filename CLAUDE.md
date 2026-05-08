@@ -273,35 +273,7 @@ corp-extractor document process report.pdf --pdf-parser glm_ocr_parser          
 corp-extractor document process https://example.com/article
 corp-extractor document process https://example.com/report.pdf --use-ocr
 
-# Entity database
-corp-extractor db import-sec --download  # Bulk SEC data (73K filers)
-corp-extractor db import-people --all    # Notable people from Wikidata (v0.9.0)
-corp-extractor db import-people --type executive --skip-existing  # Skip existing records
-corp-extractor db import-people --type executive --enrich-dates   # Fetch role dates (slower)
-corp-extractor db import-sec-officers --start-year 2023 --limit 10000  # SEC Form 4 officers (v0.9.3)
-corp-extractor db import-ch-officers --file officers.zip --limit 10000  # CH officers (v0.9.3)
-corp-extractor db import-wikidata-dump --download --limit 50000   # From Wikidata dump (v0.9.1)
-corp-extractor db import-wikidata-dump --dump /path/to/dump.bz2 --people --no-orgs  # Local dump
-corp-extractor db import-wikidata-dump --dump dump.bz2 --resume  # Resume from file position
-corp-extractor db import-wikidata-dump --dump dump.bz2 --skip-updates  # Skip existing Q codes
-corp-extractor db import-wikidata-dump --download --require-enwiki  # Only orgs with English Wikipedia
-corp-extractor db import-wikidata-dump --dump dump.bz2 --locations --no-people --no-orgs  # Locations only (v0.9.4)
-corp-extractor db canonicalize           # Link equivalent records across sources
-corp-extractor db post-import            # Run after any import: embeddings + USearch index + VACUUM
-corp-extractor db post-import --no-orgs  # People only
-corp-extractor db build-index            # Build USearch HNSW index for fast ANN search
-corp-extractor db rebuild-vec            # Rebuild vec0 tables with distance_metric=cosine
-corp-extractor db status                 # Show database statistics
-corp-extractor db status --for-llm       # Output schema and enum tables for LLM docs
-corp-extractor db search "Microsoft"     # Search organizations (USearch HNSW)
-corp-extractor db search "Microsoft" --hybrid  # Hybrid text + embeddings search
-corp-extractor db search-people "Tim Cook"  # Search people (v0.9.0)
-corp-extractor db search-roles "CEO"     # Search roles (v0.9.4)
-corp-extractor db search-locations "California"  # Search locations (v0.9.4)
-corp-extractor db upload                 # Upload with lite variant + USearch indexes
-corp-extractor db download               # Download lite version + USearch indexes (default)
-corp-extractor db download --full        # Download full version + USearch indexes
-corp-extractor --db-version=2 db download  # Download v2 database files
-corp-extractor db migrate-v2 entities.db entities-v2.db  # Migrate to v2 schema (v0.9.4)
-corp-extractor db backfill-scalar        # Generate int8 embeddings (v0.9.4)
+# Entity database — moved out to the corp-entity-db project in v0.10.0.
+# All db CLI commands now live there. See https://corp-entity-db.vercel.app/
+# for the canonical CLI reference, search, download, and build instructions.
 ```

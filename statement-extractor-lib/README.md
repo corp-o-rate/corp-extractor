@@ -439,69 +439,31 @@ Taxonomy classifiers return **multiple labels** per statement above the confiden
 
 ## Entity Database
 
-The library includes an **entity embedding database** for fast entity qualification using vector similarity search. It stores records from authoritative sources (GLEIF, SEC, Companies House, Wikidata) with 768-dimensional embeddings for semantic matching.
+As of v0.10.0 the entity database is a separate project — see the
+[corp-entity-db project](https://corp-entity-db.vercel.app/) for search,
+download, build, and CLI documentation. `corp-extractor` depends on it
+for qualification; the thin re-export shims under
+`statement_extractor.database` (e.g. `OrganizationDatabase`,
+`PersonDatabase`, `get_database`) still work for backwards compat.
 
-**Quick start:**
-```bash
-corp-extractor db download              # Download pre-built database + USearch indexes
-corp-extractor db search "Microsoft"    # Search organizations
-corp-extractor db search-people "Tim Cook"  # Search people
-corp-extractor db search-roles "CEO"    # Search roles (v0.9.4)
-corp-extractor db search-locations "California"  # Search locations (v0.9.4)
-```
+## v0.9.5: USearch HNSW Indexes & Parallel Import
 
-For comprehensive documentation including schema, CLI reference, Python API, and build instructions, see **[ENTITY_DATABASE.md](./ENTITY_DATABASE.md)**.
+v0.9.5 introduced **USearch HNSW indexes** for sub-millisecond approximate
+nearest neighbor search and a **3-thread parallel import pipeline** for
+fast Wikidata dump imports. As of v0.10.0 these features are owned by the
+`corp-entity-db` package — the `db` subcommands moved with them
+(`corp-entity-db post-import`, `corp-entity-db build-index`,
+`corp-entity-db search "Microsoft" --hybrid`, etc.). The `hf_classifier`
+labeler stays in `corp-extractor`.
 
-## New in v0.9.5: USearch HNSW Indexes & Parallel Import
+## v0.9.4: Database v2 Schema
 
-v0.9.5 introduces **USearch HNSW indexes** for sub-millisecond approximate nearest neighbor search and a **3-thread parallel import pipeline** for fast Wikidata dump imports.
-
-- **USearch HNSW indexes**: Pre-built indexes for both people and organizations enable sub-millisecond search on 50M+ vectors
-- **3-thread parallel import**: Reader, embedder, and writer threads work concurrently during Wikidata dump import
-- **Multi-record person import**: One person now yields multiple records (one per position+org combination, max 10)
-- **Auto-canonicalization**: Runs automatically after dump import with recency tiebreaker (most recent from_date preferred)
-- **`--hybrid` search flag**: Combine text filtering with USearch embeddings search for higher precision
-- **Fast import extras**: Optional `orjson` (~3x JSON parsing) and `indexed_bzip2` (6x decompression)
-- **Zstandard support**: Import from `.zst`/`.zstd` compressed dumps
-- **`db post-import`**: New command to run after any import (generates embeddings, builds USearch indexes, runs VACUUM)
-- **`db build-index`**: Build or rebuild USearch HNSW indexes
-- **`hf_classifier` labeler**: New general-purpose HuggingFace sequence classification labeler plugin
-
-```bash
-# After any import, run post-import to build indexes
-corp-extractor db post-import
-
-# Or build just the USearch index
-corp-extractor db build-index
-
-# Search with hybrid mode
-corp-extractor db search "Microsoft" --hybrid
-
-# Install fast-import extras
-pip install "corp-extractor[fast-import]"
-```
-
-## New in v0.9.4: Database v2 Schema
-
-v0.9.4 introduces a **normalized v2 schema** with significant improvements:
-
-- **INTEGER FK references** replace TEXT enum columns for better query performance
-- **New enum lookup tables**: `source_types`, `people_types`, `organization_types`, `location_types`
-- **New tables**: `roles` (job titles with Wikidata QID), `locations` (countries/states/cities with hierarchy)
-- **Scalar (int8) embeddings**: 75% storage reduction with ~92% recall at top-100
-- **QID as integers**: Wikidata QIDs stored as integers (Q prefix stripped)
-- **Human-readable views**: `organizations_view`, `people_view`, `roles_view`, `locations_view`
-
-**Migration:**
-```bash
-# Migrate existing v1 database to v2
-corp-extractor db migrate-v2 entities.db entities-v2.db
-
-# Generate int8 scalar embeddings
-corp-extractor db backfill-scalar
-```
-
-**Default database path**: `~/.cache/corp-extractor/entities-v3.db`
+v0.9.4 introduced a normalized v2 schema with INTEGER FK references,
+enum lookup tables (`source_types`, `people_types`, `organization_types`,
+`location_types`), `roles` and `locations` tables, scalar (int8)
+embeddings, integer QIDs, and human-readable views. Schema management is
+now owned by `corp-entity-db` (current schema version v6 there). Default
+database path under corp-entity-db: `~/.cache/corp-extractor/entities-v6.db`.
 
 ## New in v0.6.0: Entity Embedding Database
 
@@ -548,48 +510,15 @@ Each organization record is classified with an `entity_type` field:
 
 ### Building the Database
 
-```bash
-# Import organizations from authoritative sources
-corp-extractor db import-gleif --download
-corp-extractor db import-sec --download      # Bulk submissions.zip (~100K+ filers)
-corp-extractor db import-companies-house --download
-corp-extractor db import-wikidata --limit 50000
-
-# Import notable people (v0.9.0)
-corp-extractor db import-people --type executive --limit 5000
-corp-extractor db import-people --all --limit 10000  # All person types
-corp-extractor db import-people --type executive --skip-existing  # Skip existing records
-corp-extractor db import-people --type executive --enrich-dates   # Fetch role start/end dates
-
-# Import from Wikidata dump (v0.9.1) - avoids SPARQL timeouts
-corp-extractor db import-wikidata-dump --download --limit 50000   # Downloads ~100GB dump
-corp-extractor db import-wikidata-dump --dump /path/to/dump.bz2 --people --no-orgs  # Local dump
-corp-extractor db import-wikidata-dump --dump dump.bz2 --locations --no-people --no-orgs  # Locations only (v0.9.4)
-
-# Migrate to v2 schema (v0.9.4)
-corp-extractor db migrate-v2 entities.db entities-v2.db
-corp-extractor db backfill-scalar        # Generate int8 embeddings (75% smaller)
-
-# Post-import: generate embeddings, build USearch indexes, VACUUM (v0.9.5)
-corp-extractor db post-import
-corp-extractor db post-import --no-orgs  # People only
-
-# Build USearch HNSW index for fast ANN search (v0.9.5)
-corp-extractor db build-index
-
-# Check status
-corp-extractor db status
-
-# Search for an organization
-corp-extractor db search "Microsoft"
-
-# Search for a person (v0.9.0)
-corp-extractor db search-people "Tim Cook"
-```
+Build/import/publish is owned by the
+[corp-entity-db project](https://corp-entity-db.vercel.app/). See
+[ENTITY_DATABASE.md](./ENTITY_DATABASE.md) for the project-level overview.
 
 ### Using in Pipeline
 
-The database is automatically used by the `embedding_company_qualifier` plugin for Stage 3 (Qualification):
+The database is automatically used by the `embedding_company_qualifier`
+plugin (Stage 3, Qualification) — `corp-extractor` consumes it via the
+`corp-entity-db` package transparently:
 
 ```python
 from statement_extractor.pipeline import ExtractionPipeline
@@ -600,26 +529,6 @@ ctx = pipeline.process("Microsoft acquired Activision Blizzard.")
 for stmt in ctx.labeled_statements:
     print(f"{stmt.subject_fqn}")  # e.g., "Microsoft (sec_edgar:0000789019)"
 ```
-
-### Publishing to HuggingFace
-
-```bash
-# Upload database with all variants (full, lite, USearch indexes)
-export HF_TOKEN="hf_..."
-corp-extractor db upload                     # Uses default cache location
-corp-extractor db upload entities-v3.db      # Or specify path
-corp-extractor db upload --no-lite           # Skip lite version
-
-# Download pre-built database + USearch indexes (lite version by default)
-corp-extractor db download                   # Lite version + USearch indexes
-corp-extractor db download --full            # Full version + USearch indexes
-corp-extractor --db-version=2 db download    # Download v2 files
-
-# Local database management
-corp-extractor db create-lite entities-v3.db # Create lite version (drops embeddings)
-```
-
-See [ENTITY_DATABASE.md](./ENTITY_DATABASE.md) for complete build and publish instructions.
 
 ## New in v0.7.0: Document Processing
 

@@ -110,68 +110,74 @@ doc_pipeline = DocumentPipeline(server_url="http://localhost:8111")
 
 > **Note:** `server_url` is for the Python API only. CLI delegation uses `--server` / `--server-url` flags or the `CORP_EXTRACTOR_SERVER` env var.
 
-### RunPod Serverless
+### Cerebrium Serverless (Production)
 
-<span id="runpod-serverless" />
+<span id="cerebrium-serverless" />
 
-**Why RunPod:**
+**Why Cerebrium:**
 
-- **Pay-per-use**: ~$0.0002/sec on average
-- **Scales to zero**: No cost when idle
-- **No infrastructure**: Managed GPU containers
+- **Pay-per-use** GPU containers; scales to zero when idle.
+- **Shared `/persistent-storage` volume** with the
+  [corp-entity-db](https://corp-entity-db.vercel.app/) Cerebrium app, so
+  the entity database, USearch indexes, and embedding model weights are
+  downloaded once and reused across both apps.
+- **One synchronous request/response** — no polling. The frontend API
+  route uses `maxDuration=300` and retries once on cold-boot timeout.
 
 **Setup steps:**
 
-1. Clone the repository and build the Docker image:
+1. Install the Cerebrium CLI and confirm you are in the same project as
+   the corp-entity-db app (so `/persistent-storage` is shared):
 
-```bash
-cd runpod
-docker build --platform linux/amd64 -t your-username/statement-extractor .
-```
+   ```bash
+   pip install cerebrium
+   cerebrium projects current
+   ```
 
-2. Push to Docker Hub:
+2. Set the `HF_TOKEN` secret (gated model downloads):
 
-```bash
-docker push your-username/statement-extractor
-```
+   ```bash
+   cerebrium secrets set HF_TOKEN <your-token>
+   ```
 
-3. Create a RunPod serverless endpoint:
-   - Go to [RunPod Console](https://www.runpod.io/console/serverless?ref=sjoylkgj)
-   - Create new endpoint with your Docker image
-   - Configure GPU type (RTX 3090 recommended)
-   - Set Active Workers: 0, Max Workers: 1-3
+3. Deploy:
 
-4. Call the API:
+   ```bash
+   cd cerebrium
+   cerebrium deploy
+   ```
 
-```bash
-curl -X POST https://api.runpod.ai/v2/YOUR_ENDPOINT/runsync \
-  -H "Authorization: Bearer YOUR_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"input": {"text": "<page>Your text here</page>"}}'
-```
+   Or push to `main` — `.github/workflows/cerebrium-deploy.yml`
+   auto-deploys on changes to `cerebrium/**`.
 
-**Pricing:**
+4. Call the API (auth: service-account token or per-app inference key):
 
-<table>
-  <thead>
-    <tr>
-      <th>GPU Type</th>
-      <th>Cost</th>
-      <th>Notes</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td>RTX 3090</td>
-      <td>~$0.00031/sec</td>
-      <td>Recommended</td>
-    </tr>
-    <tr>
-      <td>Idle</td>
-      <td>$0</td>
-      <td>Scales to zero</td>
-    </tr>
-  </tbody>
-</table>
+   ```bash
+   curl -X POST \
+     -H "Authorization: Bearer $CEREBRIUM_TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{"text": "<page>Your text here</page>"}' \
+     https://api.aws.us-east-1.cerebrium.ai/v4/<project-id>/statement-extractor/extract
+   ```
 
-Typical extraction costs less than $0.001 per request at ~2s processing time.
+   Cerebrium returns a `{run_id, result, run_time_ms}` envelope; the
+   handler payload is in `.result`.
+
+**Hardware:** currently `ADA_L40` (48 GB, hobby-plan max) — fits T5-Gemma2
+in bf16 with comfortable headroom. The Gemma-3-12B GGUF qualifier runs
+CPU-only via `llama-cpp-python`.
+
+See [`cerebrium/README.md`](https://github.com/corp-o-rate/corp-extractor/blob/main/cerebrium/README.md)
+for cold-start expectations, GPU alternatives, and troubleshooting.
+
+### RunPod Serverless (Legacy)
+
+<span id="runpod-serverless" />
+
+The original deployment used [RunPod](https://runpod.io?ref=sjoylkgj)
+serverless GPU containers via `runpod/Dockerfile` and an async
+submit-and-poll API surface. **Superseded by Cerebrium** for the
+production demo so we can share storage with the corp-entity-db app.
+The container build is retained at
+[`runpod/`](https://github.com/corp-o-rate/corp-extractor/tree/main/runpod)
+for reference; it is no longer the active path.

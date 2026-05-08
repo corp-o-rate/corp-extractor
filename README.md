@@ -8,6 +8,7 @@ Uses fine-tuned [T5-Gemma 2](https://blog.google/technology/developers/t5gemma-2
 
 - **Statement Extraction**: Transform unstructured text into structured subject-predicate-object triples
 - **5-Stage Pipeline** *(v0.8.0)*: Plugin-based architecture with entity qualification, labeling, and taxonomy classification
+- **Entity DB extracted to `corp-entity-db`** *(v0.10.0)*: Organizations, people, roles, and locations now live in the separate [corp-entity-db](https://pypi.org/project/corp-entity-db/) PyPI package. Use the `corp-entity-db` CLI for DB management; `corp-extractor` consumes it for qualification only.
 - **Database v3 Schema** *(v0.9.6)*: Lite databases drop all embedding tables — USearch indexes for search. Global `--db-version` flag for backwards compatibility.
 - **USearch HNSW Indexes** *(v0.9.5)*: Sub-millisecond search on 50M+ vectors with pre-built HNSW indexes
 - **Entity Database** *(v0.9.6)*: 9.7M+ organizations and 63M+ people with USearch HNSW indexes for fast entity qualification
@@ -108,42 +109,16 @@ pipeline = ExtractionPipeline(server_url="http://localhost:8111")
 
 See [statement-extractor-lib/README.md](statement-extractor-lib/README.md) for full pipeline documentation.
 
-### Entity Database (v0.6.0+)
+### Entity Database (`corp-entity-db` package, v0.10.0+)
 
-Build an entity embedding database for fast organization and person qualification:
+As of v0.10.0 the entity database is a separate project — see the
+[corp-entity-db project](https://corp-entity-db.vercel.app/) for search,
+download, build, and CLI documentation. `corp-extractor` depends on it
+for entity qualification; you don't need to touch it directly to use
+the extraction pipeline.
 
-```bash
-# Import from authoritative sources
-corp-extractor db import-gleif --download      # 3.2M global entities (LEI)
-corp-extractor db import-sec --download        # 100K+ US SEC filers (CIK)
-corp-extractor db import-companies-house --download  # 5M UK companies
-corp-extractor db import-wikidata --limit 50000  # Notable organizations (SPARQL)
-
-# Import notable people (v0.9.0)
-corp-extractor db import-people --all --limit 10000  # SPARQL-based
-
-# Import from Wikidata dump (v0.9.1) - avoids SPARQL timeouts
-corp-extractor db import-wikidata-dump --download --limit 50000  # Uses ~100GB dump
-corp-extractor db import-wikidata-dump --dump dump.json.bz2 --resume  # Resume interrupted import
-
-# Post-import: generate embeddings, build USearch indexes, VACUUM
-corp-extractor db post-import
-
-# Canonicalize organizations (v0.9.2) - link equivalent records
-corp-extractor db canonicalize
-
-# Search
-corp-extractor db search "Microsoft"
-corp-extractor db search-people "Tim Cook"
-
-# Download pre-built database from HuggingFace
-corp-extractor db download
-
-# Download older v2 database files
-corp-extractor --db-version=2 db download
-```
-
-See [ENTITY_DATABASE.md](ENTITY_DATABASE.md) for complete build and publish instructions.
+See [ENTITY_DATABASE.md](ENTITY_DATABASE.md) for the project-level overview
+of how `corp-extractor` consumes the database for qualification.
 
 ### Direct Model Access
 
@@ -200,42 +175,42 @@ print(result)
 
 ## Deployment Options
 
-### RunPod Serverless (Recommended for Production)
+### Cerebrium Serverless (Recommended for Production)
 
-Deploy to [RunPod](https://runpod.io?ref=sjoylkgj) for scalable, pay-per-use GPU inference (~$0.0002/sec).
+Production deploys to [Cerebrium](https://www.cerebrium.ai/) into the same
+project as the corp-entity-db app, sharing `/persistent-storage` so model
+weights and the entity DB are reused across both apps.
 
 ```bash
-cd runpod
-
-# Build and push Docker image (--platform flag required on Mac)
-docker build --platform linux/amd64 -t statement-extractor-runpod .
-docker tag statement-extractor-runpod YOUR_USERNAME/statement-extractor-runpod
-docker push YOUR_USERNAME/statement-extractor-runpod
+cd cerebrium
+cerebrium projects current             # confirm correct project
+cerebrium secrets set HF_TOKEN <token> # gated model downloads
+cerebrium deploy
 ```
 
-Then on RunPod:
-1. Go to [runpod.io/console/serverless](https://www.runpod.io/console/serverless?ref=sjoylkgj)
-2. Click **New Endpoint**
-3. Set container image to your pushed image
-4. Select GPU (RTX 3090+ recommended)
-5. Set Active Workers: 0, Max Workers: 1-3
+Endpoints (auth: `Authorization: Bearer <CEREBRIUM_TOKEN>`):
 
-Call the API:
-```bash
-curl -X POST https://api.runpod.ai/v2/YOUR_ENDPOINT_ID/runsync \
-  -H "Authorization: Bearer YOUR_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"input": {"text": "<page>Your text here</page>"}}'
+```
+POST https://api.aws.us-east-1.cerebrium.ai/v4/<project-id>/statement-extractor/extract
+POST https://api.aws.us-east-1.cerebrium.ai/v4/<project-id>/statement-extractor/extract_url
 ```
 
-**Pricing** (pay only when processing):
-| Usage | Monthly Cost |
-|-------|--------------|
-| 100 req/day | ~$0.19 |
-| 1,000 req/day | ~$1.86 |
-| Idle | $0 |
+Calls run synchronously and return the full payload (no polling). The
+frontend API route (`src/app/api/extract/route.ts`) wraps each call with a
+one-shot retry on Vercel timeout, and `src/app/page.tsx` fires a
+localStorage-gated browser warm-up ping on page load so cold-boot is
+absorbed before the user submits a real query. Auto-deploy is wired up
+via `.github/workflows/cerebrium-deploy.yml` on pushes that touch
+`cerebrium/**`.
 
-See [runpod/README.md](runpod/README.md) for detailed instructions.
+See [cerebrium/README.md](cerebrium/README.md) for full deployment notes,
+GPU choices, and troubleshooting.
+
+### RunPod Serverless (Legacy)
+
+Superseded by Cerebrium. The container build and handler in
+[runpod/](runpod/) are retained for reference; they are not the active
+production path. See [runpod/README.md](runpod/README.md).
 
 ### Local Server
 
@@ -261,12 +236,16 @@ uv run python upload_model.py
 
 ## Environment Variables
 
+See [`.env.example`](.env.example) for the canonical list. Key variables:
+
 | Variable | Description |
 |----------|-------------|
-| `RUNPOD_ENDPOINT_ID` | RunPod endpoint ID (recommended for production) |
-| `RUNPOD_API_KEY` | RunPod API key |
-| `LOCAL_MODEL_URL` | Local server URL for web demo (e.g., `http://localhost:8000`) |
+| `CEREBRIUM_EXTRACT_URL` | Cerebrium `/extract` endpoint URL (production) |
+| `CEREBRIUM_EXTRACT_URL_URL` | Cerebrium `/extract_url` endpoint URL (production) |
+| `CEREBRIUM_TOKEN` | Cerebrium service-account token or per-app inference key |
+| `LOCAL_MODEL_URL` | Local server URL for the web demo (e.g., `http://localhost:8000`) |
 | `CORP_EXTRACTOR_SERVER` | Corp-extractor persistent server URL (e.g., `http://localhost:8111`) |
+| `HF_TOKEN` | HuggingFace token for gated model downloads |
 
 ## Tech Stack
 

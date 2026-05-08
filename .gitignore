@@ -61,3 +61,4 @@ uv.lock
 /model/
 /.claude/settings.local.json
 /statement-extractor-lib/.claude/settings.local.json
+.env*.local

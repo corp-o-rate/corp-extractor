@@ -35,10 +35,16 @@ cerebrium deploy
 cerebrium logs statement-extractor --follow
 ```
 
-Endpoints after deploy:
+Endpoints after deploy (hostname uses `api.<provider>.<region>.cerebrium.ai`
+— check the deploy log; for the current project that's
+`api.aws.us-east-1.cerebrium.ai`):
 
-- `POST https://api.cortex.cerebrium.ai/v4/<project-id>/statement-extractor/extract`
-- `POST https://api.cortex.cerebrium.ai/v4/<project-id>/statement-extractor/extract_url`
+- `POST https://api.aws.us-east-1.cerebrium.ai/v4/<project-id>/statement-extractor/extract`
+- `POST https://api.aws.us-east-1.cerebrium.ai/v4/<project-id>/statement-extractor/extract_url`
+
+For the current corp-o-rate project the project id is `p-7f30f35c`. The
+GitHub Action at `.github/workflows/cerebrium-deploy.yml` auto-deploys
+on pushes to `main` that touch `cerebrium/**`.
 
 Auth: `Authorization: Bearer <CEREBRIUM_TOKEN>`.
 
@@ -53,7 +59,7 @@ while they download into `/persistent-storage/hf/`. Subsequent boots are warm.
 curl -X POST -H "Authorization: Bearer $CEREBRIUM_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"text":"Apple announced a new iPhone."}' \
-  https://api.cortex.cerebrium.ai/v4/<project-id>/statement-extractor/extract
+  https://api.aws.us-east-1.cerebrium.ai/v4/<project-id>/statement-extractor/extract
 ```
 
 Cerebrium returns a `{run_id, result, run_time_ms}` envelope; the handler's
@@ -61,10 +67,13 @@ payload is in `.result`.
 
 ## Hardware
 
-- `AMPERE_A100` (40 GB) — defensive starting point. T5-Gemma2 in bf16 is
-  ~20 GB, GLiNER2 + embedders maybe ~3 GB; the Gemma-3-12B GGUF qualifier
-  runs CPU-only via llama-cpp-python and doesn't share VRAM.
-- Once stable, downgrade to `ADA_L4` (24 GB) — same VRAM headroom for less.
+- Currently `ADA_L40` (48 GB) — largest GPU available on the Cerebrium
+  hobby plan. T5-Gemma2 in bf16 is ~20 GB, GLiNER2 + embedders ~3 GB,
+  with comfortable headroom. The Gemma-3-12B GGUF qualifier runs CPU-only
+  via llama-cpp-python and doesn't share VRAM.
+- `AMPERE_A100_40GB` / `AMPERE_A100_80GB` are available on paid plans if
+  more headroom is needed.
+- `ADA_L4` (24 GB) is the cheapest hobby option that still fits T5-Gemma2.
 
 ## Troubleshooting
 

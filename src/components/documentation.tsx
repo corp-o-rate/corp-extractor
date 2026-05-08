@@ -4,13 +4,13 @@ import { useState, useEffect } from 'react';
 import { Copy, Check, ExternalLink, Terminal, Code2, Server, Cloud } from 'lucide-react';
 import { toast } from 'sonner';
 
-type TabId = 'cli' | 'python' | 'typescript' | 'runpod' | 'local' | 'output';
+type TabId = 'cli' | 'python' | 'typescript' | 'cerebrium' | 'local' | 'output';
 
 const TABS: { id: TabId; label: string; icon: React.ReactNode }[] = [
   { id: 'cli', label: 'CLI', icon: <Terminal className="w-4 h-4" /> },
   { id: 'python', label: 'Python', icon: <Code2 className="w-4 h-4" /> },
   { id: 'typescript', label: 'TypeScript', icon: <Code2 className="w-4 h-4" /> },
-  { id: 'runpod', label: 'RunPod', icon: <Cloud className="w-4 h-4" /> },
+  { id: 'cerebrium', label: 'Cerebrium', icon: <Cloud className="w-4 h-4" /> },
   { id: 'local', label: 'Run Locally', icon: <Server className="w-4 h-4" /> },
   { id: 'output', label: 'Output Format', icon: <Terminal className="w-4 h-4" /> },
 ];
@@ -255,67 +255,74 @@ async function extractStatements(text: string): Promise<string> {
   return response.generated_text;
 }
 
-// For production use, we recommend RunPod or running locally
-// See the "RunPod" or "Run Locally" tabs for setup instructions
+// For production use, we recommend Cerebrium or running locally
+// See the "Cerebrium" or "Run Locally" tabs for setup instructions
 
 // Example usage
 const text = "Apple Inc. announced a commitment to carbon neutrality by 2030.";
 const result = await extractStatements(text);
 console.log(result);`,
 
-  runpod: `# Deploy to RunPod Serverless (~$0.0002/sec GPU)
+  cerebrium: `# Deploy to Cerebrium Serverless
 
-## 1. Build and push Docker image
+## 1. Install the CLI and confirm project
 \`\`\`bash
-git clone https://github.com/corp-o-rate/statement-extractor
-cd statement-extractor/runpod
-
-# Build the image (--platform flag required on Mac)
-docker build --platform linux/amd64 -t statement-extractor-runpod .
-
-# Push to Docker Hub
-docker tag statement-extractor-runpod YOUR_USERNAME/statement-extractor-runpod
-docker push YOUR_USERNAME/statement-extractor-runpod
+pip install cerebrium
+cerebrium projects current
 \`\`\`
 
-## 2. Create RunPod Endpoint
-1. Go to runpod.io/console/serverless?ref=sjoylkgj
-2. Click "New Endpoint"
-3. Set container image to your pushed image
-4. Select GPU (RTX 3090+ recommended)
-5. Set Active Workers: 0, Max Workers: 1-3
+The deployment shares /persistent-storage with the corp-entity-db
+Cerebrium app, so the entity database, USearch indexes, and
+embeddinggemma weights are reused across both apps.
 
-## 3. Call the API
+## 2. Set the HF_TOKEN secret (gated model downloads)
 \`\`\`bash
-curl -X POST https://api.runpod.ai/v2/YOUR_ENDPOINT_ID/runsync \\
-  -H "Authorization: Bearer YOUR_API_KEY" \\
+cerebrium secrets set HF_TOKEN <your-token>
+\`\`\`
+
+## 3. Deploy
+\`\`\`bash
+git clone https://github.com/corp-o-rate/corp-extractor
+cd corp-extractor/cerebrium
+cerebrium deploy
+\`\`\`
+
+Or push to main — .github/workflows/cerebrium-deploy.yml auto-deploys
+on changes to cerebrium/**.
+
+## 4. Call the API
+\`\`\`bash
+curl -X POST \\
+  -H "Authorization: Bearer \$CEREBRIUM_TOKEN" \\
   -H "Content-Type: application/json" \\
-  -d '{"input": {"text": "<page>Your text here</page>"}}'
+  -d '{"text": "<page>Your text here</page>"}' \\
+  https://api.aws.us-east-1.cerebrium.ai/v4/<project-id>/statement-extractor/extract
 \`\`\`
+
+Cerebrium returns a {run_id, result, run_time_ms} envelope; the handler
+payload is in .result.
 
 ## TypeScript Client
 \`\`\`typescript
 const response = await fetch(
-  \`https://api.runpod.ai/v2/\${ENDPOINT_ID}/runsync\`,
+  \`https://api.aws.us-east-1.cerebrium.ai/v4/\${PROJECT_ID}/statement-extractor/extract\`,
   {
     method: 'POST',
     headers: {
-      'Authorization': \`Bearer \${RUNPOD_API_KEY}\`,
+      'Authorization': \`Bearer \${CEREBRIUM_TOKEN}\`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({
-      input: { text: \`<page>\${text}</page>\` },
-    }),
+    body: JSON.stringify({ text: \`<page>\${text}</page>\` }),
   }
 );
-const data = await response.json();
-const output = data.output.output; // XML statements
+const envelope = await response.json();
+const result = envelope.result; // ExtractionResult model_dump
 \`\`\`
 
-## Pricing (pay only when processing)
-- RTX 3090: ~$0.00031/sec (~$1.12/hr active)
-- Idle: $0 (scales to zero)
-- 1000 requests/day: ~$1.86/month`,
+## Hardware
+Currently ADA_L40 (48 GB) — largest GPU available on the Cerebrium
+hobby plan. T5-Gemma2 fits comfortably in bf16; the Gemma-3-12B GGUF
+qualifier runs CPU-only via llama-cpp-python.`,
 
   local: `# Run Locally (No API Limits)
 
@@ -424,7 +431,7 @@ const TAB_LANGUAGES: Record<TabId, string> = {
   cli: 'bash',
   python: 'python',
   typescript: 'typescript',
-  runpod: 'bash',
+  cerebrium: 'bash',
   local: 'bash',
   output: 'xml',
 };
