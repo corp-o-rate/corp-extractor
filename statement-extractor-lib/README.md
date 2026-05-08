@@ -8,6 +8,7 @@ Analyze complex text to extract relationship information about people and organi
 
 ## Features
 
+- **Entity DB extracted to `corp-entity-db`** *(v0.10.0)*: Organization/person/role/location storage, importers, canonicalization, and search now live in a separate [corp-entity-db](https://pypi.org/project/corp-entity-db/) package. `corp-extractor` depends on it for qualification but no longer ships its own importer/CLI commands. Use the `corp-entity-db` CLI directly for DB management.
 - **Database v3** *(v0.9.6)*: Lite databases drop all embedding tables — USearch indexes distributed with `db download`/`db upload`. Global `--db-version` flag for version control.
 - **USearch HNSW Indexes** *(v0.9.5)*: Sub-millisecond approximate nearest neighbor search on 50M+ vectors with pre-built HNSW indexes
 - **Parallel Import** *(v0.9.5)*: 3-thread pipeline (reader/embedder/writer) for fast Wikidata dump import with optional orjson and indexed_bzip2

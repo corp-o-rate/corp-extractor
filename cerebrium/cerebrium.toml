@@ -43,9 +43,9 @@ response_grace_period = 3600
 [cerebrium.dependencies.pip]
 # corp-extractor's own pyproject pulls in transformers>=5.0.0rc3 (T5Gemma2
 # support landed in that RC), gliner2, accelerate, llama-cpp-python,
-# fastapi/uvicorn, and corp-entity-db. We don't re-declare those here so
-# pip's dependency resolver picks one consistent version set.
-"corp-extractor" = ">=0.9.8"
+# fastapi/uvicorn, and corp-entity-db>=0.1.0. We don't re-declare those
+# here so pip's dependency resolver picks one consistent version set.
+"corp-extractor" = ">=0.10.0"
 
 [cerebrium.dependencies.apt]
 # (none)

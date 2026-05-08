@@ -346,8 +346,8 @@ class PersonQualifierPlugin(BaseQualifierPlugin):
             org_matched = []
             org_unmatched = []
             for record, sim in results:
-                if record.known_for_org and self._org_matches(extracted_org, record.known_for_org):
-                    logger.debug(f"      Org match: {record.name} at {record.known_for_org}")
+                if record.known_for_org_name and self._org_matches(extracted_org, record.known_for_org_name):
+                    logger.debug(f"      Org match: {record.name} at {record.known_for_org_name}")
                     org_matched.append((record, sim))
                 else:
                     org_unmatched.append((record, sim))
@@ -381,7 +381,7 @@ class PersonQualifierPlugin(BaseQualifierPlugin):
         logger.info(f"    Found {len(scored_results)} candidates for '{person_name}':")
         for i, (record, sim, boosted) in enumerate(scored_results[:5], 1):
             role_str = f" ({record.known_for_role})" if record.known_for_role else ""
-            org_str = f" at {record.known_for_org}" if record.known_for_org else ""
+            org_str = f" at {record.known_for_org_name}" if record.known_for_org_name else ""
             boost_delta = boosted - sim
             boost_info = f" [+{boost_delta:.3f} boost]" if boost_delta > 0 else ""
             logger.info(f"      {i}. {record.name}{role_str}{org_str} (sim={sim:.3f}, boosted={boosted:.3f}{boost_info})")
@@ -408,7 +408,7 @@ class PersonQualifierPlugin(BaseQualifierPlugin):
                 "source_id": record.source_id,
                 "similarity": similarity,
                 "known_for_role": record.known_for_role,
-                "known_for_org": record.known_for_org,
+                "known_for_org_name": record.known_for_org_name,
                 "birth_date": record.birth_date,
                 "death_date": record.death_date,
                 "is_historic": record.is_historic,
@@ -445,10 +445,10 @@ class PersonQualifierPlugin(BaseQualifierPlugin):
                 logger.debug(f"      Role match boost: {extracted_role} ~ {record.known_for_role}")
 
         # Boost if org matches (fuzzy)
-        if extracted_org and record.known_for_org:
-            if self._org_matches(extracted_org, record.known_for_org):
+        if extracted_org and record.known_for_org_name:
+            if self._org_matches(extracted_org, record.known_for_org_name):
                 score += 0.15  # +15% boost (org is stronger signal)
-                logger.debug(f"      Org match boost: {extracted_org} ~ {record.known_for_org}")
+                logger.debug(f"      Org match boost: {extracted_org} ~ {record.known_for_org_name}")
 
         return min(score, 1.0)  # Cap at 1.0
 
@@ -582,7 +582,7 @@ class PersonQualifierPlugin(BaseQualifierPlugin):
         candidate_lines = []
         for i, (record, similarity, boosted) in enumerate(candidates[:10], 1):
             role_str = f", {record.known_for_role}" if record.known_for_role else ""
-            org_str = f" at {record.known_for_org}" if record.known_for_org else ""
+            org_str = f" at {record.known_for_org_name}" if record.known_for_org_name else ""
             country_str = f", {record.country}" if record.country else ""
             # Include life dates for context (helps identify historic figures)
             dates_parts = []
@@ -763,7 +763,7 @@ NAME:"""
 
             # Extract role and org from database match
             known_role = str(match_details.get("known_for_role", "") or "")
-            known_org = str(match_details.get("known_for_org", "") or "")
+            known_org = str(match_details.get("known_for_org_name", "") or "")
 
             # Create ResolvedRole from database match
             if known_role:

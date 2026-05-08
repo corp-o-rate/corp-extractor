@@ -4,12 +4,19 @@ Qualifier models for the extraction pipeline.
 EntityQualifiers: Semantic qualifiers and external identifiers
 QualifiedEntity: Entity with qualification information from Stage 3
 ResolvedRole: Canonical role information from database
-ResolvedOrganization: Canonical organization information from database
+ResolvedOrganization: Canonical organization information from database (re-exported from corp_entity_db)
 """
 
-from typing import Any, Optional
+from typing import Optional
 
 from pydantic import BaseModel, Field
+
+# ResolvedOrganization is owned by corp-entity-db (the OrganizationResolver
+# constructs and returns instances of it). Re-export here so EntityQualifiers
+# uses the same class identity that the resolver returns — otherwise Pydantic
+# V2 would reject a corp_entity_db.ResolvedOrganization instance assigned to
+# a field typed against a separately-defined local class with the same shape.
+from corp_entity_db.models import ResolvedOrganization
 
 from .entity import EntityType
 
@@ -27,20 +34,7 @@ class ResolvedRole(BaseModel):
     source_id: Optional[str] = Field(None, description="ID in the source (e.g., 'Q484876' for Wikidata)")
 
 
-class ResolvedOrganization(BaseModel):
-    """
-    Resolved/canonical organization information.
-
-    Populated when resolving an organization mentioned in context
-    against the organization database (GLEIF, SEC, Companies House, Wikidata).
-    """
-    canonical_name: str = Field(..., description="Canonical organization name")
-    canonical_id: str = Field(..., description="Full canonical ID (e.g., 'LEI:549300XYZ', 'SEC-CIK:1234567')")
-    source: str = Field(..., description="Source of resolution (e.g., 'gleif', 'sec_edgar', 'wikidata')")
-    source_id: str = Field(..., description="ID in the source")
-    region: Optional[str] = Field(None, description="Organization's region/jurisdiction")
-    match_confidence: float = Field(default=1.0, description="Confidence in the match (0-1)")
-    match_details: Optional[dict[str, Any]] = Field(None, description="Additional match details")
+__all__ = ["ResolvedRole", "ResolvedOrganization", "EntityQualifiers", "QualifiedEntity"]
 
 
 class EntityQualifiers(BaseModel):

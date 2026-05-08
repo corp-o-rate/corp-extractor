@@ -50,7 +50,7 @@ RUN --mount=type=secret,id=hf_token \
     print(f'Gemma3 GGUF model downloaded to {path}')"
 
 # Install corp-extractor library
-RUN pip install --no-cache-dir --no-deps corp-extractor==0.9.4
+RUN pip install --no-cache-dir --no-deps corp-extractor==0.10.0
 
 # Verify imports work correctly
 RUN python -c "from statement_extractor.plugins import BaseQualifierPlugin, BaseLabelerPlugin, BaseTaxonomyPlugin; \
