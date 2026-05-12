@@ -6,23 +6,24 @@ import { getCachedStatements, setCachedStatements } from '@/lib/cache';
 
 // Cold-boot of a Cerebrium replica (T5-Gemma2 + GLiNER2 + GGUF qualifier
 // loading from /persistent-storage) can take several minutes on the very
-// first hit after scale-to-zero. Vercel hobby caps function duration at
-// 300s; we use the full window and rely on a one-shot retry below to land
-// the second attempt on a now-warm replica.
-export const maxDuration = 300;
+// first hit after scale-to-zero, and the full 5-stage pipeline (Stage 2
+// GLiNER2 + Stage 3 qualification + Stage 5 taxonomy) is itself minute-scale
+// on longer inputs. We use a wide window and a single retry path so the
+// second attempt lands on a now-warm replica when the first cold attempt
+// aborts. Requires the Vercel project plan to allow this maxDuration.
+export const maxDuration = 800;
 
 const CEREBRIUM_EXTRACT_URL = process.env.CEREBRIUM_EXTRACT_URL;
 const CEREBRIUM_EXTRACT_URL_URL = process.env.CEREBRIUM_EXTRACT_URL_URL;
 const CEREBRIUM_TOKEN = process.env.CEREBRIUM_TOKEN;
 const LOCAL_MODEL_URL = process.env.LOCAL_MODEL_URL;
 
-// Per-attempt client-side timeout. We give the first attempt 240s so a
-// retry has ~60s to land if the first aborts. If neither attempt finishes
-// within the 300s function budget, Vercel kills the request and the
-// frontend's warmup ping (page.tsx) will have spun the replica up by the
-// next user action.
-const FIRST_ATTEMPT_TIMEOUT_MS = 240_000;
-const RETRY_ATTEMPT_TIMEOUT_MS = 50_000;
+// Per-attempt client-side timeout. We give the first attempt the bulk of the
+// budget and reserve enough for a single retry to land if the first aborts
+// (typically a cold replica that's now warming). The two windows must fit
+// inside `maxDuration` minus a few seconds of overhead.
+const FIRST_ATTEMPT_TIMEOUT_MS = 720_000;
+const RETRY_ATTEMPT_TIMEOUT_MS = 60_000;
 
 interface CerebriumEnvelope {
   run_id?: string;
@@ -30,22 +31,44 @@ interface CerebriumEnvelope {
   run_time_ms?: number;
 }
 
+/** Distinguish "the client gave up" from "the server returned an error". */
+class CerebriumTimeoutError extends Error {
+  constructor(public timeoutMs: number) {
+    super(`Cerebrium request aborted after ${Math.round(timeoutMs / 1000)}s`);
+    this.name = 'CerebriumTimeoutError';
+  }
+}
+class CerebriumResponseError extends Error {
+  constructor(public status: number, public body: string) {
+    super(`Cerebrium returned status ${status}: ${body.slice(0, 300)}`);
+    this.name = 'CerebriumResponseError';
+  }
+}
+
 async function callCerebrium(endpointUrl: string, body: object, timeoutMs: number): Promise<unknown> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetch(endpointUrl, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${CEREBRIUM_TOKEN}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    });
+    let response: Response;
+    try {
+      response = await fetch(endpointUrl, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${CEREBRIUM_TOKEN}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+    } catch (err) {
+      if (err instanceof Error && err.name === 'AbortError') {
+        throw new CerebriumTimeoutError(timeoutMs);
+      }
+      throw err;
+    }
     if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Cerebrium error: status=${response.status}, body=${errorText.slice(0, 500)}`);
+      const errorText = await response.text().catch(() => '<no body>');
+      throw new CerebriumResponseError(response.status, errorText);
     }
     const envelope = (await response.json()) as CerebriumEnvelope;
     return envelope.result ?? envelope;
@@ -59,15 +82,44 @@ async function callCerebriumWithRetry(endpointUrl: string, body: object): Promis
   try {
     return await callCerebrium(endpointUrl, body, FIRST_ATTEMPT_TIMEOUT_MS);
   } catch (firstError) {
-    const isAbort = firstError instanceof Error && firstError.name === 'AbortError';
+    const isTimeout = firstError instanceof CerebriumTimeoutError;
     console.warn(
-      `Cerebrium first attempt failed (${isAbort ? 'timeout' : 'error'}):`,
+      `Cerebrium first attempt failed (${isTimeout ? 'timeout' : 'error'}):`,
       firstError instanceof Error ? firstError.message : firstError,
     );
-    // Retry once. The cold-start should have triggered the replica to spin
-    // up during the first attempt, so the second hit usually returns fast.
+    // Only retry if the first attempt timed out (replica likely still cold).
+    // For server-side errors (4xx/5xx) a retry will just hit the same fault.
+    if (!isTimeout) throw firstError;
     return await callCerebrium(endpointUrl, body, RETRY_ATTEMPT_TIMEOUT_MS);
   }
+}
+
+/** Map a Cerebrium failure to a Next.js response with an accurate status + message. */
+function cerebriumErrorResponse(err: unknown): NextResponse {
+  if (err instanceof CerebriumTimeoutError) {
+    return NextResponse.json(
+      {
+        error: `Extraction timed out after ${Math.round(err.timeoutMs / 1000)}s. The Cerebrium replica may still be cold-starting — try again in a moment.`,
+        kind: 'timeout',
+      },
+      { status: 504 },
+    );
+  }
+  if (err instanceof CerebriumResponseError) {
+    return NextResponse.json(
+      {
+        error: `Cerebrium responded with ${err.status}: ${err.body.slice(0, 300)}`,
+        kind: 'upstream_error',
+        status: err.status,
+      },
+      { status: 502 },
+    );
+  }
+  const msg = err instanceof Error ? err.message : String(err);
+  return NextResponse.json(
+    { error: `Extraction failed: ${msg}`, kind: 'unknown' },
+    { status: 502 },
+  );
 }
 
 export async function POST(request: NextRequest) {
@@ -107,7 +159,9 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    // Cerebrium (primary production backend).
+    // Cerebrium (primary production backend). If it errors or times out we
+    // surface the actual failure instead of masking with the cached example —
+    // that fallback is reserved for "no backend configured".
     if (CEREBRIUM_EXTRACT_URL && CEREBRIUM_TOKEN) {
       try {
         console.log(`Calling Cerebrium /extract: textLen=${text.length}`);
@@ -133,8 +187,8 @@ export async function POST(request: NextRequest) {
         };
         return NextResponse.json(result);
       } catch (cerebriumError) {
-        console.warn('Cerebrium unavailable:', cerebriumError);
-        // Fall through to local model / cached example.
+        console.warn('Cerebrium call failed:', cerebriumError);
+        return cerebriumErrorResponse(cerebriumError);
       }
     }
 
@@ -219,16 +273,8 @@ async function handleUrlExtraction(
         cached: !!payload.cached,
       });
     } catch (cerebriumError) {
-      console.warn('Cerebrium unavailable for URL processing:', cerebriumError);
-      return NextResponse.json(
-        {
-          error:
-            cerebriumError instanceof Error
-              ? cerebriumError.message
-              : 'Cerebrium error during URL processing',
-        },
-        { status: 502 },
-      );
+      console.warn('Cerebrium URL extraction failed:', cerebriumError);
+      return cerebriumErrorResponse(cerebriumError);
     }
   }
 
