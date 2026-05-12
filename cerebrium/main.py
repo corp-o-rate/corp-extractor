@@ -75,20 +75,13 @@ print("=" * 60)
 # ---------------------------------------------------------------------------
 # Heavy imports AFTER cache redirection.
 # ---------------------------------------------------------------------------
-from statement_extractor import (
-    ExtractionOptions,
-    PredicateComparisonConfig,
-    PredicateTaxonomy,
-    ScoringConfig,
-    StatementExtractor,
-)
 from statement_extractor.document import (
     DocumentPipeline,
     DocumentPipelineConfig,
     URLLoaderConfig,
 )
 from statement_extractor.models.document import ChunkingConfig
-from statement_extractor.pipeline import PipelineConfig
+from statement_extractor.pipeline import ExtractionPipeline, PipelineConfig
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -136,7 +129,7 @@ CANONICAL_PREDICATES = [
 # Lazy global state. Init under a lock so concurrent first-requests don't
 # each kick off the same multi-GB model download.
 # ---------------------------------------------------------------------------
-_extractor: Optional[StatementExtractor] = None
+_pipeline: Optional[ExtractionPipeline] = None
 _doc_pipeline: Optional[DocumentPipeline] = None
 _inference_lock = threading.Lock()  # serialise GPU access (replica_concurrency=1, but be defensive)
 _init_lock = threading.Lock()
@@ -174,23 +167,27 @@ def _initialize() -> None:
     loop. Lock prevents concurrent first-requests from doubling up the
     multi-GB downloads.
     """
-    global _extractor, _doc_pipeline, _initialized
+    global _pipeline, _doc_pipeline, _initialized
     if _initialized:
         return
     with _init_lock:
         if _initialized:
             return
 
+        # Build the pipelines — the underlying T5-Gemma + GLiNER2 + entity DB
+        # are loaded lazily by their respective plugins on first request, so
+        # cold-start cost is shifted to that first call (vs. eager loading
+        # here, which would double-load if we kept a separate StatementExtractor).
         t0 = time.time()
-        logger.info("Initialising statement extractor (T5-Gemma2 + GLiNER2)...")
-        _extractor = StatementExtractor(model_id=MODEL_ID)
-        logger.info(f"Extractor loaded on device={_extractor.device} in {time.time() - t0:.1f}s")
-
-        t1 = time.time()
-        logger.info("Initialising document pipeline...")
+        logger.info("Initialising text pipeline (Stages 1-5)...")
         pipeline_config = PipelineConfig(
             disabled_plugins={"mnli_taxonomy_classifier"},  # use embedding classifier (faster)
         )
+        _pipeline = ExtractionPipeline(pipeline_config)
+        logger.info(f"Text pipeline ready in {time.time() - t0:.1f}s")
+
+        t1 = time.time()
+        logger.info("Initialising document pipeline...")
         doc_config = DocumentPipelineConfig(
             chunking=ChunkingConfig(target_tokens=1000, overlap_tokens=100),
             generate_summary=True,
@@ -204,21 +201,31 @@ def _initialize() -> None:
 
 
 def _extract_sync(text: str, use_canonical_predicates: bool, similarity_threshold: float) -> dict:
-    options = ExtractionOptions(
-        num_beams=DEFAULT_NUM_BEAMS,
-        max_new_tokens=DEFAULT_MAX_NEW_TOKENS,
-        merge_beams=True,
-        embedding_dedup=True,
-        use_gliner_extraction=True,
-        scoring_config=ScoringConfig(),
-        predicate_config=PredicateComparisonConfig(similarity_threshold=similarity_threshold),
-    )
+    """Run the full 5-stage pipeline so the response includes qualified entities,
+    canonical IDs, labels (sentiment/relation_type), and taxonomy classifications."""
+    assert _pipeline is not None
+    metadata: dict = {
+        "splitter_options": {
+            "num_beams": DEFAULT_NUM_BEAMS,
+            "max_new_tokens": DEFAULT_MAX_NEW_TOKENS,
+        },
+        "extractor_options": {
+            "similarity_threshold": similarity_threshold,
+        },
+    }
     if use_canonical_predicates:
-        options.predicate_taxonomy = PredicateTaxonomy(predicates=CANONICAL_PREDICATES)
+        metadata["extractor_options"]["canonical_predicates"] = CANONICAL_PREDICATES
 
-    assert _extractor is not None
-    result = _extractor.extract(text, options)
-    return result.model_dump()
+    ctx = _pipeline.process(text, metadata=metadata)
+    # PipelineContext.model_dump() emits labeled_statements with
+    # subject_canonical / object_canonical / labels / taxonomy_results — the
+    # shape the frontend parser expects (parseModelDumpLabeledStatements).
+    # Exclude ctx-level scratchpad dicts: `taxonomy_results` has tuple keys
+    # (unserialisable to JSON) and `classification_results` is internal-only.
+    return ctx.model_dump(
+        mode="json",
+        exclude={"taxonomy_results", "classification_results"},
+    )
 
 
 def _process_url_sync(url: str, use_ocr: bool, max_tokens: int, overlap_tokens: int) -> dict:
