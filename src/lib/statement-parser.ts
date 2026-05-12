@@ -27,12 +27,16 @@
  * </statements>
  */
 
-import { Statement, EntityType, Entity, ExtractionMethod, StatementLabel, TaxonomyResult } from './types';
+import { Statement, EntityType, Entity, ExtractionMethod, StatementLabel, TaxonomyResult, EntityQualifiers } from './types';
 
 // Type for the JSON format from the library
 interface LibraryEntity {
   text: string;
   type: string;
+  fqn?: string;
+  canonical_id?: string | null;
+  name?: string;
+  qualifiers?: Record<string, unknown> | null;
 }
 
 interface LibraryLabel {
@@ -74,26 +78,57 @@ interface LibraryExtractionResult {
 }
 
 // LabeledStatement from pipeline output (as_dict format)
+interface AsDictEntity {
+  text: string;
+  type: string;
+  fqn?: string;
+  canonical_id?: string | null;
+  name?: string;
+  qualifiers?: Record<string, unknown> | null;
+}
+
 interface LibraryLabeledStatement {
-  subject: {
-    text: string;
-    type: string;
-    fqn: string;
-    canonical_id?: string | null;
-  };
+  subject: AsDictEntity;
   predicate: string;
-  object: {
-    text: string;
-    type: string;
-    fqn: string;
-    canonical_id?: string | null;
-  };
+  predicate_category?: string | null;
+  object: AsDictEntity;
   source_text?: string | null;
   labels?: Record<string, string | number | boolean>;
   taxonomy?: Array<{ category: string; label: string; confidence: number }>;
 }
 
 // LabeledStatement from pipeline output (model_dump format)
+interface ModelDumpQualifiedEntity {
+  entity_ref?: string;
+  original_text?: string;
+  entity_type?: string;
+  qualifiers?: {
+    legal_name?: string | null;
+    org?: string | null;
+    role?: string | null;
+    region?: string | null;
+    country?: string | null;
+    city?: string | null;
+    jurisdiction?: string | null;
+    identifiers?: Record<string, string>;
+  };
+}
+
+interface ModelDumpCanonicalEntity {
+  entity_ref?: string;
+  qualified_entity?: ModelDumpQualifiedEntity;
+  canonical_match?: {
+    canonical_id?: string | null;
+    canonical_name?: string | null;
+    match_method?: string | null;
+    match_confidence?: number | null;
+  } | null;
+  fqn?: string;
+  // The Pydantic `name` property isn't serialized but downstream callers
+  // may attach one anyway — accept it if present.
+  name?: string | null;
+}
+
 interface ModelDumpLabeledStatement {
   statement: {
     subject: { text: string; type: string; entity_ref?: string };
@@ -105,16 +140,8 @@ interface ModelDumpLabeledStatement {
     canonical_predicate?: string | null;
     extraction_method?: string | null;
   };
-  subject_canonical: {
-    name: string;
-    fqn: string;
-    qualifiers?: Array<{ identifier_type: string; identifier_value: string }>;
-  };
-  object_canonical: {
-    name: string;
-    fqn: string;
-    qualifiers?: Array<{ identifier_type: string; identifier_value: string }>;
-  };
+  subject_canonical: ModelDumpCanonicalEntity;
+  object_canonical: ModelDumpCanonicalEntity;
   labels: Array<{ label_type: string; label_value: string | number | boolean; confidence: number; labeler?: string }>;
   taxonomy_results: Array<{ taxonomy_name: string; category: string; label: string; label_id?: number; confidence: number; classifier?: string }>;
 }
@@ -152,6 +179,110 @@ function parseExtractionMethod(methodStr: string | null | undefined): Extraction
   }
 
   return undefined;
+}
+
+/**
+ * Coerce a raw qualifier dict (from as_dict / model_dump) into our
+ * EntityQualifiers shape. Drops empty values.
+ */
+function coerceQualifiers(raw: Record<string, unknown> | null | undefined): EntityQualifiers | undefined {
+  if (!raw) return undefined;
+  const out: EntityQualifiers = {};
+  const idMap: Record<string, string> = {};
+
+  const stringFields: Array<keyof EntityQualifiers> = [
+    'legal_name', 'org', 'role', 'region', 'country', 'city',
+    'jurisdiction', 'source', 'source_id',
+  ];
+  for (const k of stringFields) {
+    const v = raw[k as string];
+    if (typeof v === 'string' && v.length > 0) (out as Record<string, string>)[k as string] = v;
+  }
+
+  const nested = raw['identifiers'];
+  if (nested && typeof nested === 'object') {
+    for (const [k, v] of Object.entries(nested as Record<string, unknown>)) {
+      if (typeof v === 'string' && v.length > 0) idMap[k] = v;
+    }
+  }
+  // Some payloads include identifier-style keys at the top level (e.g. lei, ticker).
+  // Sweep them in too — anything we didn't already consume.
+  for (const [k, v] of Object.entries(raw)) {
+    if (stringFields.includes(k as keyof EntityQualifiers)) continue;
+    if (k === 'identifiers') continue;
+    if (typeof v === 'string' && v.length > 0) idMap[k] = v;
+  }
+  if (Object.keys(idMap).length > 0) out.identifiers = idMap;
+
+  return Object.keys(out).length === 0 ? undefined : out;
+}
+
+/**
+ * Build an Entity from an as_dict-shaped library entity (flat).
+ */
+function entityFromAsDict(raw: AsDictEntity | undefined): Entity {
+  if (!raw) return { name: '', type: 'UNKNOWN' };
+  const quals = coerceQualifiers(raw.qualifiers ?? null);
+  const displayName = raw.name?.trim() || raw.text?.trim() || '';
+  return {
+    name: displayName,
+    type: parseEntityType(raw.type),
+    text: raw.text || undefined,
+    fqn: raw.fqn || undefined,
+    canonicalId: raw.canonical_id ?? undefined,
+    qualifiers: quals,
+  };
+}
+
+/**
+ * Build an Entity from a Pydantic model_dump CanonicalEntity branch.
+ */
+function entityFromModelDump(
+  canonical: ModelDumpCanonicalEntity | undefined,
+  fallback: { text?: string; type?: string },
+): Entity {
+  const qualified = canonical?.qualified_entity;
+  const q = qualified?.qualifiers ?? {};
+  const identifiers = q.identifiers ?? {};
+
+  const quals: EntityQualifiers = {};
+  if (q.legal_name) quals.legal_name = q.legal_name;
+  if (q.org) quals.org = q.org;
+  if (q.role) quals.role = q.role;
+  const region = q.region ?? q.jurisdiction ?? q.country;
+  if (region) quals.region = region;
+  if (q.country) quals.country = q.country;
+  if (q.city) quals.city = q.city;
+  if (q.jurisdiction) quals.jurisdiction = q.jurisdiction;
+  if (identifiers.source) quals.source = identifiers.source;
+  if (identifiers.source_id) quals.source_id = identifiers.source_id;
+  const otherIds: Record<string, string> = {};
+  for (const [k, v] of Object.entries(identifiers)) {
+    if (k === 'source' || k === 'source_id' || k === 'canonical_id') continue;
+    if (typeof v === 'string' && v.length > 0) otherIds[k] = v;
+  }
+  if (Object.keys(otherIds).length > 0) quals.identifiers = otherIds;
+
+  const cm = canonical?.canonical_match ?? null;
+  const canonicalId = cm?.canonical_id ?? identifiers.canonical_id ?? undefined;
+  const displayName = canonical?.name?.trim()
+    || quals.legal_name
+    || cm?.canonical_name
+    || qualified?.original_text
+    || fallback.text
+    || '';
+
+  const out: Entity = {
+    name: displayName,
+    type: parseEntityType(fallback.type ?? qualified?.entity_type ?? null),
+    text: fallback.text || qualified?.original_text || undefined,
+    fqn: canonical?.fqn || undefined,
+    canonicalId: canonicalId || undefined,
+    qualifiers: Object.keys(quals).length > 0 ? quals : undefined,
+  };
+  if (cm?.match_method) out.matchMethod = cm.match_method;
+  if (typeof cm?.match_confidence === 'number') out.matchConfidence = cm.match_confidence;
+  return out;
 }
 
 /**
@@ -305,14 +436,8 @@ function parseJsonStatements(data: LibraryExtractionResult | LibraryStatement[])
     }
 
     return {
-      subject: {
-        name: stmt.subject?.text || '',
-        type: parseEntityType(stmt.subject?.type || null),
-      },
-      object: {
-        name: stmt.object?.text || '',
-        type: parseEntityType(stmt.object?.type || null),
-      },
+      subject: entityFromAsDict(stmt.subject as AsDictEntity),
+      object: entityFromAsDict(stmt.object as AsDictEntity),
       predicate: stmt.predicate || '',
       predicateCategory: stmt.predicate_category ?? undefined,
       text: stmt.source_text || `${stmt.subject?.text || ''} ${stmt.predicate || ''} ${stmt.object?.text || ''}`.trim(),
@@ -330,14 +455,16 @@ function parseJsonStatements(data: LibraryExtractionResult | LibraryStatement[])
  */
 function parseLabeledStatements(labeledStmts: LibraryLabeledStatement[]): Statement[] {
   return labeledStmts.map((stmt) => {
-    // Convert labels dict to array
+    // Convert labels dict to array. The as_dict shape may embed a numeric
+    // `confidence` key alongside the string label values — surface it as a
+    // dedicated label so the UI can show overall confidence.
     const labels: StatementLabel[] = [];
     if (stmt.labels) {
       for (const [label_type, label_value] of Object.entries(stmt.labels)) {
         labels.push({
           label_type,
           label_value,
-          confidence: 1.0, // Labels from as_dict don't include confidence
+          confidence: typeof label_value === 'number' ? label_value : 1.0,
         });
       }
     }
@@ -350,17 +477,18 @@ function parseLabeledStatements(labeledStmts: LibraryLabeledStatement[]): Statem
       confidence: t.confidence,
     }));
 
+    const confidenceLabel = labels.find(l => l.label_type === 'confidence');
+    const overallConfidence = typeof confidenceLabel?.label_value === 'number'
+      ? confidenceLabel.label_value
+      : undefined;
+
     return {
-      subject: {
-        name: stmt.subject?.text || '',
-        type: parseEntityType(stmt.subject?.type || null),
-      },
-      object: {
-        name: stmt.object?.text || '',
-        type: parseEntityType(stmt.object?.type || null),
-      },
+      subject: entityFromAsDict(stmt.subject),
+      object: entityFromAsDict(stmt.object),
       predicate: stmt.predicate || '',
+      predicateCategory: stmt.predicate_category ?? undefined,
       text: stmt.source_text || `${stmt.subject?.text || ''} ${stmt.predicate || ''} ${stmt.object?.text || ''}`.trim(),
+      confidence: overallConfidence,
       labels: labels.length > 0 ? labels : undefined,
       taxonomyResults: taxonomyResults.length > 0 ? taxonomyResults : undefined,
     };
@@ -378,9 +506,14 @@ function parseModelDumpLabeledStatements(labeledStmts: ModelDumpLabeledStatement
   return labeledStmts.map((item) => {
     const stmt = item.statement;
 
-    // Use canonical name if available, otherwise fall back to statement text
-    const subjectName = item.subject_canonical?.name || stmt.subject?.text || '';
-    const objectName = item.object_canonical?.name || stmt.object?.text || '';
+    const subject = entityFromModelDump(item.subject_canonical, {
+      text: stmt.subject?.text,
+      type: stmt.subject?.type,
+    });
+    const object = entityFromModelDump(item.object_canonical, {
+      text: stmt.object?.text,
+      type: stmt.object?.type,
+    });
 
     // Parse labels array
     const labels: StatementLabel[] = (item.labels || []).map(l => ({
@@ -401,17 +534,11 @@ function parseModelDumpLabeledStatements(labeledStmts: ModelDumpLabeledStatement
     }));
 
     return {
-      subject: {
-        name: subjectName,
-        type: parseEntityType(stmt.subject?.type || null),
-      },
-      object: {
-        name: objectName,
-        type: parseEntityType(stmt.object?.type || null),
-      },
+      subject,
+      object,
       predicate: stmt.predicate || '',
       predicateCategory: stmt.predicate_category ?? undefined,
-      text: stmt.source_text || `${subjectName} ${stmt.predicate || ''} ${objectName}`.trim(),
+      text: stmt.source_text || `${subject.name} ${stmt.predicate || ''} ${object.name}`.trim(),
       confidence: stmt.confidence_score ?? undefined,
       canonicalPredicate: stmt.canonical_predicate ?? undefined,
       extractionMethod: parseExtractionMethod(stmt.extraction_method),

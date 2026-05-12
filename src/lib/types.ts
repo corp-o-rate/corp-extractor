@@ -19,9 +19,36 @@ export type EntityType =
 
 export type ExtractionMethod = 'hybrid' | 'spacy' | 'split' | 'model' | 'gliner_relation';
 
+/** Flattened qualifier fields surfaced from EntityQualifiers + identifiers. */
+export interface EntityQualifiers {
+  legal_name?: string;
+  org?: string;
+  role?: string;
+  region?: string;
+  country?: string;
+  city?: string;
+  jurisdiction?: string;
+  source?: string;
+  source_id?: string;
+  /** Remaining identifiers (lei, ch_number, sec_cik, ticker, wikidata_qid, ...) */
+  identifiers?: Record<string, string>;
+}
+
 export interface Entity {
+  /** Canonical display name when resolved, else the raw extracted text. */
   name: string;
   type: EntityType;
+  /** The raw extracted span from the source text. */
+  text?: string;
+  /** Fully qualified name, e.g. "Tim Cook (CEO, Apple Inc)". */
+  fqn?: string;
+  /** Canonical ID (e.g. "WIKIDATA:Q123", "LEI:5493001KJTIIGC8Y1R12"). */
+  canonicalId?: string;
+  /** Qualifier fields flattened for display. */
+  qualifiers?: EntityQualifiers;
+  /** Canonical-match metadata, when available. */
+  matchMethod?: string;
+  matchConfidence?: number;
 }
 
 /** Label applied to a statement (sentiment, relation_type, etc.) */
