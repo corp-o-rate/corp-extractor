@@ -59,9 +59,17 @@ if _VOLUME is not None:
     os.environ["XDG_CACHE_HOME"] = str(_VOLUME)
     print(f"[init] HF_HOME = {_hf_dir}")
 
+    # IMPORTANT: write to corp_entity_db.hub directly. The
+    # statement_extractor.database.hub shim re-exports DEFAULT_CACHE_DIR
+    # as a bound name, so setting it on the shim has no effect on the
+    # downloader functions that read corp_entity_db.hub.DEFAULT_CACHE_DIR.
+    import corp_entity_db.hub as _ce_hub
+    _ce_hub.DEFAULT_CACHE_DIR = _VOLUME
+    print(f"[init] corp_entity_db.hub.DEFAULT_CACHE_DIR = {_VOLUME}")
+    # Keep the shim in sync too so any caller importing through the
+    # statement_extractor namespace sees the same value.
     import statement_extractor.database.hub as _hub
     _hub.DEFAULT_CACHE_DIR = _VOLUME
-    print(f"[init] statement_extractor.database.hub.DEFAULT_CACHE_DIR = {_VOLUME}")
 else:
     print("[init] WARNING: no volume with >=40 GB free — first request will fail "
           "or run out of disk. Resize the project volume before sending requests.")
