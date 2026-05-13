@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useRef, useCallback } from 'react';
-import { Loader2, Sparkles, Trash2, Shuffle, Link, FileText, Upload, X, File } from 'lucide-react';
+import { Loader2, Sparkles, Trash2, Shuffle, Link, FileText, Upload, X, File, XCircle } from 'lucide-react';
 import { CACHED_INPUT } from '@/lib/cached-example';
 import { toast } from 'sonner';
 
@@ -21,6 +21,9 @@ const MAX_FILE_SIZE = 1024 * 1024; // 1MB
 
 interface StatementInputProps {
   onExtract: (input: ExtractionInput) => void;
+  /** Called when the user clicks the Cancel button while a run is in-flight.
+   *  Should abort the polling loop on the page-level controller. */
+  onCancel?: () => void;
   isLoading: boolean;
   elapsedSeconds?: number;
 }
@@ -40,7 +43,7 @@ const EXAMPLE_TEXTS = [
   },
 ];
 
-export function StatementInput({ onExtract, isLoading, elapsedSeconds = 0 }: StatementInputProps) {
+export function StatementInput({ onExtract, onCancel, isLoading, elapsedSeconds = 0 }: StatementInputProps) {
   const [inputMode, setInputMode] = useState<InputMode>('text');
   const [text, setText] = useState('');
   const [url, setUrl] = useState('');
@@ -389,25 +392,34 @@ export function StatementInput({ onExtract, isLoading, elapsedSeconds = 0 }: Sta
         {/* Actions */}
         <div className="mt-4 flex flex-wrap gap-3 items-center justify-between">
           <div className="flex gap-3">
-            <button
-              type="submit"
-              disabled={!hasInput || isLoading}
-              className="btn-brutal"
-            >
-              {isLoading ? (
-                <>
-                  <Loader2 className="w-4 h-4 mr-2 spinner" />
+            {isLoading ? (
+              <button
+                type="button"
+                onClick={onCancel}
+                disabled={!onCancel}
+                className="btn-brutal"
+                aria-label="Cancel extraction"
+                title="Stop polling for results — Cerebrium keeps running but the UI lets go."
+              >
+                <Loader2 className="w-4 h-4 mr-2 spinner" />
+                <span className="mr-2">
                   {elapsedSeconds > 0 ? `Processing... (${elapsedSeconds}s)` : 'Submitting...'}
-                </>
-              ) : (
-                <>
-                  <Sparkles className="w-4 h-4 mr-2" />
-                  {inputMode === 'url'
-                    ? (file ? 'Extract from File' : 'Extract from URL')
-                    : 'Extract Statements'}
-                </>
-              )}
-            </button>
+                </span>
+                <XCircle className="w-4 h-4" />
+                <span className="ml-1">Cancel</span>
+              </button>
+            ) : (
+              <button
+                type="submit"
+                disabled={!hasInput}
+                className="btn-brutal"
+              >
+                <Sparkles className="w-4 h-4 mr-2" />
+                {inputMode === 'url'
+                  ? (file ? 'Extract from File' : 'Extract from URL')
+                  : 'Extract Statements'}
+              </button>
+            )}
 
             {hasInput && (
               <button

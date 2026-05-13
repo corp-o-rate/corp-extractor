@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Header } from '@/components/header';
 import { Footer } from '@/components/footer';
 import { StatementInput, ExtractionInput } from '@/components/statement-input';
@@ -29,11 +29,11 @@ const PREWARM_TTL_MS = 60 * 60 * 1000;
 // invocations (~150/run cap for a 5-minute job) and tight enough that the
 // UI updates promptly when the run finishes.
 const POLL_INTERVAL_MS = 2_000;
-// Hard ceiling on how long the browser will keep polling. The Cerebrium
-// replica's `response_grace_period` is 1h; we'll give up after 15 minutes
-// of total wait, which covers a worst-case cold-start (~10 min for first
-// DB download) plus pipeline runtime.
-const POLL_TIMEOUT_MS = 15 * 60 * 1000;
+// Hard ceiling on how long the browser will keep polling. Matches the
+// Cerebrium replica's `response_grace_period` of 1h so a worst-case
+// cold-start that does land successfully on the backend still reaches
+// the user. The user can also hit Cancel to bail out before this fires.
+const POLL_TIMEOUT_MS = 60 * 60 * 1000;
 
 interface ExtractionPoll {
   run_id?: string;
@@ -92,6 +92,9 @@ export default function Home() {
   const [showWarmUpDialog, setShowWarmUpDialog] = useState(false);
   const [showTimeoutDialog, setShowTimeoutDialog] = useState(false);
   const [warmUpDialogDismissed, setWarmUpDialogDismissed] = useState(false);
+  // Held outside React state so the Cancel button can abort the in-flight
+  // poll loop without re-rendering. Cleared once the run finishes.
+  const pollAbortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     setUserUuid(getUserUuid());
@@ -169,7 +172,12 @@ export default function Home() {
       let payload = (await response.json()) as ExtractionPoll;
       if (payload.run_id && payload.status !== 'succeeded') {
         const ac = new AbortController();
-        payload = await pollExtractionRun(payload.run_id, ac.signal);
+        pollAbortRef.current = ac;
+        try {
+          payload = await pollExtractionRun(payload.run_id, ac.signal);
+        } finally {
+          pollAbortRef.current = null;
+        }
       }
 
       const statements = payload.statements || [];
@@ -189,16 +197,18 @@ export default function Home() {
       }
     } catch (error) {
       console.error('Extraction error:', error);
-      // A network-level abort/timeout (browser timed out, or poll exceeded
-      // its deadline) gets surfaced as the timeout dialog rather than a bare
-      // toast.
       const message = error instanceof Error ? error.message : 'Failed to extract statements';
-      const looksLikeTimeout = /timeout|abort|504|gateway/i.test(message);
+      // User-initiated cancel: swallow silently. The poll loop throws an
+      // Error('aborted') when the AbortController fires; we don't want to
+      // show a toast or the timeout dialog for that.
+      if (/^aborted$/i.test(message)) {
+        toast.info('Cancelled');
+        return;
+      }
+      // Network-level timeout (poll exceeded its deadline) → show the timeout
+      // dialog rather than a bare toast.
+      const looksLikeTimeout = /timeout|504|gateway/i.test(message);
       if (looksLikeTimeout) {
-        clearInterval(timerInterval);
-        setIsLoading(false);
-        setElapsedSeconds(0);
-        setShowWarmUpDialog(false);
         setShowTimeoutDialog(true);
         return;
       }
@@ -208,7 +218,12 @@ export default function Home() {
       setIsLoading(false);
       setElapsedSeconds(0);
       setShowWarmUpDialog(false);
+      pollAbortRef.current = null;
     }
+  };
+
+  const handleCancelExtraction = () => {
+    pollAbortRef.current?.abort();
   };
 
   const handleStatementsChange = (newStatements: Statement[]) => {
@@ -338,7 +353,7 @@ export default function Home() {
 
             {/* Input Section */}
             <div className="brutal-card p-6 md:p-8">
-              <StatementInput onExtract={handleExtract} isLoading={isLoading} elapsedSeconds={elapsedSeconds} />
+              <StatementInput onExtract={handleExtract} onCancel={handleCancelExtraction} isLoading={isLoading} elapsedSeconds={elapsedSeconds} />
             </div>
           </div>
         </section>
