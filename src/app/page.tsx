@@ -22,9 +22,6 @@ import { WarmUpDialog } from '@/components/warm-up-dialog';
 
 // Show warm-up dialog after this many seconds of in-flight extraction
 const WARMUP_DIALOG_THRESHOLD = 30;
-// Pre-warm the Cerebrium replica at most once per hour per browser.
-const PREWARM_KEY = 'corp-extractor:lastPrewarm';
-const PREWARM_TTL_MS = 60 * 60 * 1000;
 // Poll cadence for async extraction runs. 2s is gentle on Vercel function
 // invocations (~150/run cap for a 5-minute job) and tight enough that the
 // UI updates promptly when the run finishes.
@@ -100,29 +97,14 @@ export default function Home() {
     setUserUuid(getUserUuid());
   }, []);
 
-  // Pre-warm the Cerebrium replica on load if we haven't in the last hour.
-  // First cold-start (model download into /persistent-storage) can take
-  // minutes; firing a dummy /api/extract from the browser means the replica
-  // is usually warm by the time the user submits a real query.
+  // Fire a warmup ping on every page load. Cerebrium's cooldown is short
+  // (60s) so the replica is almost always cold when a user lands; kicking
+  // it via /api/warmup means the heavy model + index loads happen before
+  // the user submits, not during. The route is fire-and-forget — it
+  // doesn't write to Supabase or wait for a webhook, just nudges the
+  // replica to spin up.
   useEffect(() => {
-    try {
-      const last = Number(localStorage.getItem(PREWARM_KEY) ?? 0);
-      if (Date.now() - last < PREWARM_TTL_MS) return;
-      localStorage.setItem(PREWARM_KEY, String(Date.now()));
-    } catch {
-      return;
-    }
-    // Submission returns ~immediately with a run_id under the async path,
-    // so the warmup ping no longer hangs for 50s and stops generating
-    // "Cancelled, 50.0s" noise in the Cerebrium dashboard. We don't poll
-    // the resulting run — Cerebrium has already started spinning up the
-    // replica by the time the 202 comes back, which is the whole point.
-    fetch('/api/extract', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: 'warmup' }),
-      keepalive: true,
-    }).catch(() => {});
+    fetch('/api/warmup', { method: 'POST', keepalive: true }).catch(() => {});
   }, []);
 
   // Show warm-up dialog after threshold seconds of loading
