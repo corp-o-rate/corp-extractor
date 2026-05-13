@@ -10,7 +10,7 @@ import { RelationshipGraph } from '@/components/relationship-graph';
 import { RateLimitBanner } from '@/components/rate-limit-banner';
 import { QuickStart } from '@/components/documentation';
 import { LLMPrompts } from '@/components/llm-prompts';
-import { ExtractionResult, Statement, UrlExtractionResult } from '@/lib/types';
+import { Statement, UrlExtractionResult } from '@/lib/types';
 import { getUserUuid } from '@/lib/user-uuid';
 import { toast } from 'sonner';
 import { ExportFormats } from '@/components/export-formats';
@@ -25,6 +25,56 @@ const WARMUP_DIALOG_THRESHOLD = 30;
 // Pre-warm the Cerebrium replica at most once per hour per browser.
 const PREWARM_KEY = 'corp-extractor:lastPrewarm';
 const PREWARM_TTL_MS = 60 * 60 * 1000;
+// Poll cadence for async extraction runs. 2s is gentle on Vercel function
+// invocations (~150/run cap for a 5-minute job) and tight enough that the
+// UI updates promptly when the run finishes.
+const POLL_INTERVAL_MS = 2_000;
+// Hard ceiling on how long the browser will keep polling. The Cerebrium
+// replica's `response_grace_period` is 1h; we'll give up after 15 minutes
+// of total wait, which covers a worst-case cold-start (~10 min for first
+// DB download) plus pipeline runtime.
+const POLL_TIMEOUT_MS = 15 * 60 * 1000;
+
+interface ExtractionPoll {
+  run_id?: string;
+  status?: 'pending' | 'running' | 'succeeded' | 'failed' | 'unknown';
+  statements?: Statement[];
+  cached?: boolean;
+  message?: string;
+  error?: string;
+  inputText?: string;
+  metadata?: UrlExtractionResult['metadata'];
+  summary?: string;
+}
+
+async function pollExtractionRun(
+  runId: string,
+  signal: AbortSignal,
+): Promise<ExtractionPoll> {
+  const deadline = Date.now() + POLL_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    if (signal.aborted) throw new Error('aborted');
+    const resp = await fetch(`/api/extract/status/${runId}`, { signal });
+    if (!resp.ok && resp.status !== 200) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.error || `Status ${resp.status}`);
+    }
+    const data = (await resp.json()) as ExtractionPoll;
+    if (data.status === 'succeeded') return data;
+    if (data.status === 'failed') {
+      throw new Error(data.error || 'Extraction failed on the backend');
+    }
+    // pending | running | unknown — wait and try again.
+    await new Promise((resolve, reject) => {
+      const t = setTimeout(resolve, POLL_INTERVAL_MS);
+      signal.addEventListener('abort', () => {
+        clearTimeout(t);
+        reject(new Error('aborted'));
+      }, { once: true });
+    });
+  }
+  throw new Error('Extraction polling timed out');
+}
 
 export default function Home() {
   const [statements, setStatements] = useState<Statement[]>([]);
@@ -59,6 +109,11 @@ export default function Home() {
     } catch {
       return;
     }
+    // Submission returns ~immediately with a run_id under the async path,
+    // so the warmup ping no longer hangs for 50s and stops generating
+    // "Cancelled, 50.0s" noise in the Cerebrium dashboard. We don't poll
+    // the resulting run — Cerebrium has already started spinning up the
+    // replica by the time the 202 comes back, which is the whole point.
     fetch('/api/extract', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -102,25 +157,30 @@ export default function Home() {
         body: JSON.stringify(requestBody),
       });
 
-      if (!response.ok) {
+      if (!response.ok && response.status !== 202) {
         const error = await response.json();
         throw new Error(error.error || 'Failed to extract statements');
       }
 
-      // Cerebrium runs synchronously; the API route returns the full payload.
-      // For URL extraction the payload is shaped like UrlExtractionResult
-      // (statements + metadata + summary); for text it's an ExtractionResult.
-      const result = (await response.json()) as ExtractionResult & Partial<UrlExtractionResult>;
+      // Submission response is either:
+      //   - 202 with `{run_id, status:'pending'}` — async path; poll for result
+      //   - 200 with the full result (cached, local-server, or cached-example
+      //     fallback) — render directly without polling
+      let payload = (await response.json()) as ExtractionPoll;
+      if (payload.run_id && payload.status !== 'succeeded') {
+        const ac = new AbortController();
+        payload = await pollExtractionRun(payload.run_id, ac.signal);
+      }
 
-      const statements = result.statements || [];
+      const statements = payload.statements || [];
       setStatements(statements);
       setEditedStatements(JSON.parse(JSON.stringify(statements)));
       setHasChanges(false);
       setIsEditMode(false);
 
-      if (result.cached && result.message) {
-        setRateLimitMessage(result.message);
-        toast.warning(result.message);
+      if (payload.cached && payload.message) {
+        setRateLimitMessage(payload.message);
+        toast.warning(payload.message);
       } else if (statements.length === 0) {
         toast.info(input.mode === 'url' ? 'No statements found in the document' : 'No statements found in the text');
       } else {
@@ -129,9 +189,9 @@ export default function Home() {
       }
     } catch (error) {
       console.error('Extraction error:', error);
-      // A network-level abort/timeout (Vercel killed the function, or the
-      // browser timed out) gets surfaced as the timeout dialog rather than a
-      // bare toast — usually means the cold-start retry didn't land.
+      // A network-level abort/timeout (browser timed out, or poll exceeded
+      // its deadline) gets surfaced as the timeout dialog rather than a bare
+      // toast.
       const message = error instanceof Error ? error.message : 'Failed to extract statements';
       const looksLikeTimeout = /timeout|abort|504|gateway/i.test(message);
       if (looksLikeTimeout) {

@@ -38,3 +38,35 @@ CREATE POLICY "Service role has full access" ON statement_extractor_cache
     FOR ALL
     USING (true)
     WITH CHECK (true);
+
+-- Async run tracking. The Vercel route inserts a 'pending' row when it
+-- submits work to Cerebrium; the Cerebrium handler updates the row with
+-- the result (or an error) when the function finishes. Browser polls
+-- /api/extract/status/<run_id> which reads from this table.
+CREATE TABLE IF NOT EXISTS extraction_runs (
+    run_id TEXT PRIMARY KEY,
+    -- pending: submitted, not yet running; running: handler started;
+    -- succeeded / failed: terminal states.
+    status TEXT NOT NULL DEFAULT 'pending',
+    -- The full Cerebrium handler return value (ExtractionResult /
+    -- DocumentContext model_dump) when status='succeeded'.
+    result JSONB,
+    error TEXT,
+    -- 'extract' or 'extract_url' so the status route can route the result
+    -- through the right parser.
+    kind TEXT NOT NULL DEFAULT 'extract',
+    -- The original user input — used to populate the result cache once
+    -- the run succeeds, and shown back in the UI.
+    input_text TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_extraction_runs_created_at ON extraction_runs (created_at);
+
+ALTER TABLE extraction_runs ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Service role has full access" ON extraction_runs
+    FOR ALL
+    USING (true)
+    WITH CHECK (true);
