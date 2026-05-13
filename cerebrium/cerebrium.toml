@@ -33,11 +33,13 @@ shell_commands = [
 ]
 
 [cerebrium.hardware]
-# ADA_L40 (48 GB) — largest GPU available on the Cerebrium hobby plan.
-# T5-Gemma2 in bf16 (~20 GB) + GLiNER2 + embedders fits comfortably; the
-# Gemma-3-12B GGUF qualifier runs on CPU via llama-cpp-python so doesn't
-# share VRAM. Was AMPERE_A100_40GB but that requires a paid plan upgrade.
-compute = "ADA_L40"
+# ADA_L4 (24 GB) — same Ada Lovelace generation as the L40 (native bf16,
+# identical software stack), at ~60% of the cost. Actual GPU footprint is
+# ~6 GB at peak: T5-Gemma2 (786M bf16 ≈ 1.6 GB) + GLiNER2/DeBERTa (~0.8 GB)
+# + embeddinggemma-300m (~1.2 GB) + activations. The Gemma-3-12B GGUF
+# disambiguator runs on CPU via llama-cpp-python so doesn't share VRAM.
+# USearch indexes live in system RAM (mmap'd), not GPU memory.
+compute = "ADA_L4"
 gpu_count = 1
 cpu = 8
 memory = 32
