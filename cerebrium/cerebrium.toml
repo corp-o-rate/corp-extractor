@@ -21,6 +21,17 @@ include = ["./main.py", "./cerebrium.toml"]
 exclude = [".git/*", "__pycache__/*", "*.pyc", ".pytest_cache/*"]
 docker_base_image_url = "nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04"
 
+# Rebuild llama-cpp-python from source without AVX-512. The default wheel is
+# compiled with AVX-512 and immediately SIGILLs (exit 132, "Illegal instruction")
+# on the ADA_L40 host CPUs the moment the Gemma-3-12B GGUF qualifier is invoked.
+# Re-installing here (after the corp-extractor wheel pulls in the binary one)
+# replaces it with a build that targets the lowest-common-denominator CPU
+# Cerebrium has run us on. Adds ~2 min to fresh builds.
+shell_commands = [
+  "pip uninstall -y llama-cpp-python",
+  "CMAKE_ARGS='-DGGML_NATIVE=OFF -DGGML_AVX512=OFF -DGGML_AVX2=ON -DGGML_FMA=ON' FORCE_CMAKE=1 pip install --no-binary llama-cpp-python --no-cache-dir 'llama-cpp-python==0.3.16'",
+]
+
 [cerebrium.hardware]
 # ADA_L40 (48 GB) — largest GPU available on the Cerebrium hobby plan.
 # T5-Gemma2 in bf16 (~20 GB) + GLiNER2 + embedders fits comfortably; the
@@ -45,6 +56,8 @@ response_grace_period = 3600
 # support landed in that RC), gliner2, accelerate, llama-cpp-python,
 # fastapi/uvicorn, and corp-entity-db>=0.1.0. We don't re-declare those
 # here so pip's dependency resolver picks one consistent version set.
+# llama-cpp-python is reinstalled from source by shell_commands above so
+# the resulting binary doesn't SIGILL on the ADA_L40 host CPU.
 "corp-extractor" = ">=0.10.0"
 
 [cerebrium.dependencies.apt]
