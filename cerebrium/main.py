@@ -149,7 +149,25 @@ CANONICAL_PREDICATES = [
 # ---------------------------------------------------------------------------
 _pipeline: Optional[ExtractionPipeline] = None
 _doc_pipeline: Optional[DocumentPipeline] = None
-_inference_lock = threading.Lock()  # serialise GPU access (replica_concurrency=1, but be defensive)
+# Single-flight gate. Cerebrium's `replica_concurrency = 1` is supposed to
+# block a second in-flight request at the proxy, but we've observed it
+# letting a queued submission through while another run is mid-pipeline.
+# Treat the lock as a hard reject (not a queue): if we can't acquire it
+# immediately, the second caller gets a busy error and the run is marked
+# failed in Supabase. Better than threading two pipelines onto one GPU.
+_inference_lock = threading.Lock()
+
+
+class ReplicaBusyError(Exception):
+    """Raised when a second request arrives while the first is still running."""
+
+
+def _try_acquire_inference():
+    """Non-blocking lock acquire. Raises ReplicaBusyError if held."""
+    if not _inference_lock.acquire(blocking=False):
+        raise ReplicaBusyError(
+            "replica busy: another extraction is already in progress on this container"
+        )
 _init_lock = threading.Lock()
 _initialized = False
 
@@ -306,10 +324,15 @@ def extract(
         return cached
 
     logger.info(f"extract: len={len(text)} canonical={use_canonical} thresh={threshold}")
+    try:
+        _try_acquire_inference()
+    except ReplicaBusyError as e:
+        logger.warning(str(e))
+        return {"error": str(e), "busy": True}
+
     t0 = time.time()
     try:
-        with _inference_lock:
-            result = _extract_sync(text, use_canonical, threshold)
+        result = _extract_sync(text, use_canonical, threshold)
     except Exception as e:
         elapsed = time.time() - t0
         logger.exception(f"extract failed after {elapsed:.2f}s")
@@ -317,6 +340,8 @@ def extract(
             "error": f"{type(e).__name__}: {e}",
             "traceback": traceback.format_exc(),
         }
+    finally:
+        _inference_lock.release()
     elapsed = time.time() - t0
     logger.info(f"extract complete in {elapsed:.2f}s")
 
@@ -357,10 +382,15 @@ def extract_url(
         return cached
 
     logger.info(f"extract_url: url={url} ocr={use_ocr} max_tokens={max_tokens}")
+    try:
+        _try_acquire_inference()
+    except ReplicaBusyError as e:
+        logger.warning(str(e))
+        return {"error": str(e), "busy": True}
+
     t0 = time.time()
     try:
-        with _inference_lock:
-            result = _process_url_sync(url, use_ocr, max_tokens, overlap_tokens)
+        result = _process_url_sync(url, use_ocr, max_tokens, overlap_tokens)
     except Exception as e:
         elapsed = time.time() - t0
         logger.exception(f"extract_url failed after {elapsed:.2f}s")
@@ -368,6 +398,8 @@ def extract_url(
             "error": f"{type(e).__name__}: {e}",
             "traceback": traceback.format_exc(),
         }
+    finally:
+        _inference_lock.release()
     elapsed = time.time() - t0
     logger.info(f"extract_url complete in {elapsed:.2f}s, statements={len(result.get('statements', []))}")
 
