@@ -182,6 +182,35 @@ function parseExtractionMethod(methodStr: string | null | undefined): Extraction
 }
 
 /**
+ * Strip the `<page>` / `</page>` wrapper tags that the Cerebrium handler
+ * adds around user input before sending it through the pipeline. Some
+ * qualifier plugins capture surrounding context greedily and leave the
+ * closing tag (or a stray `PAGE` token) in role/org/FQN strings — that's
+ * a library-side bug, but until it's fixed we sanitise on the way into
+ * the UI so the user doesn't see "Biden Administration</page>".
+ *
+ * Leaves real `<page>` / `</page>` substrings in unrelated text alone
+ * (no inputs we care about contain those literally).
+ */
+function stripPageTags(s: string): string {
+  // Drop the literal opening/closing wrappers and any whitespace they trailed.
+  let out = s.replace(/\s*<\/?\s*page\s*>\s*/gi, '');
+  // Drop a trailing standalone "PAGE" token left behind when only the tag
+  // name leaked through (e.g. "U.S. Secretary of Energy, PAGE)").
+  out = out.replace(/[,\s]+PAGE(?=[\s)\].]|$)/g, '');
+  // Strip "NONE" placeholders left by qualifiers when the upstream value
+  // was the wrapper tag and nothing real.
+  if (/^\s*NONE\s*$/i.test(out)) return '';
+  return out.trim();
+}
+
+function sanitizeQualifierValue(v: unknown): string | undefined {
+  if (typeof v !== 'string') return undefined;
+  const cleaned = stripPageTags(v);
+  return cleaned.length > 0 ? cleaned : undefined;
+}
+
+/**
  * Coerce a raw qualifier dict (from as_dict / model_dump) into our
  * EntityQualifiers shape. Drops empty values.
  */
@@ -195,14 +224,15 @@ function coerceQualifiers(raw: Record<string, unknown> | null | undefined): Enti
     'jurisdiction', 'source', 'source_id',
   ];
   for (const k of stringFields) {
-    const v = raw[k as string];
-    if (typeof v === 'string' && v.length > 0) (out as Record<string, string>)[k as string] = v;
+    const clean = sanitizeQualifierValue(raw[k as string]);
+    if (clean) (out as Record<string, string>)[k as string] = clean;
   }
 
   const nested = raw['identifiers'];
   if (nested && typeof nested === 'object') {
     for (const [k, v] of Object.entries(nested as Record<string, unknown>)) {
-      if (typeof v === 'string' && v.length > 0) idMap[k] = v;
+      const clean = sanitizeQualifierValue(v);
+      if (clean) idMap[k] = clean;
     }
   }
   // Some payloads include identifier-style keys at the top level (e.g. lei, ticker).
@@ -210,7 +240,8 @@ function coerceQualifiers(raw: Record<string, unknown> | null | undefined): Enti
   for (const [k, v] of Object.entries(raw)) {
     if (stringFields.includes(k as keyof EntityQualifiers)) continue;
     if (k === 'identifiers') continue;
-    if (typeof v === 'string' && v.length > 0) idMap[k] = v;
+    const clean = sanitizeQualifierValue(v);
+    if (clean) idMap[k] = clean;
   }
   if (Object.keys(idMap).length > 0) out.identifiers = idMap;
 
@@ -223,12 +254,14 @@ function coerceQualifiers(raw: Record<string, unknown> | null | undefined): Enti
 function entityFromAsDict(raw: AsDictEntity | undefined): Entity {
   if (!raw) return { name: '', type: 'UNKNOWN' };
   const quals = coerceQualifiers(raw.qualifiers ?? null);
-  const displayName = raw.name?.trim() || raw.text?.trim() || '';
+  const cleanName = stripPageTags(raw.name?.trim() || raw.text?.trim() || '');
+  const cleanText = raw.text ? stripPageTags(raw.text) : undefined;
+  const cleanFqn = raw.fqn ? stripPageTags(raw.fqn) : undefined;
   return {
-    name: displayName,
+    name: cleanName,
     type: parseEntityType(raw.type),
-    text: raw.text || undefined,
-    fqn: raw.fqn || undefined,
+    text: cleanText || undefined,
+    fqn: cleanFqn || undefined,
     canonicalId: raw.canonical_id ?? undefined,
     qualifiers: quals,
   };
@@ -246,37 +279,49 @@ function entityFromModelDump(
   const identifiers = q.identifiers ?? {};
 
   const quals: EntityQualifiers = {};
-  if (q.legal_name) quals.legal_name = q.legal_name;
-  if (q.org) quals.org = q.org;
-  if (q.role) quals.role = q.role;
-  const region = q.region ?? q.jurisdiction ?? q.country;
+  const legalName = sanitizeQualifierValue(q.legal_name);
+  if (legalName) quals.legal_name = legalName;
+  const org = sanitizeQualifierValue(q.org);
+  if (org) quals.org = org;
+  const role = sanitizeQualifierValue(q.role);
+  if (role) quals.role = role;
+  const region = sanitizeQualifierValue(q.region ?? q.jurisdiction ?? q.country);
   if (region) quals.region = region;
-  if (q.country) quals.country = q.country;
-  if (q.city) quals.city = q.city;
-  if (q.jurisdiction) quals.jurisdiction = q.jurisdiction;
-  if (identifiers.source) quals.source = identifiers.source;
-  if (identifiers.source_id) quals.source_id = identifiers.source_id;
+  const country = sanitizeQualifierValue(q.country);
+  if (country) quals.country = country;
+  const city = sanitizeQualifierValue(q.city);
+  if (city) quals.city = city;
+  const jurisdiction = sanitizeQualifierValue(q.jurisdiction);
+  if (jurisdiction) quals.jurisdiction = jurisdiction;
+  const source = sanitizeQualifierValue(identifiers.source);
+  if (source) quals.source = source;
+  const sourceId = sanitizeQualifierValue(identifiers.source_id);
+  if (sourceId) quals.source_id = sourceId;
   const otherIds: Record<string, string> = {};
   for (const [k, v] of Object.entries(identifiers)) {
     if (k === 'source' || k === 'source_id' || k === 'canonical_id') continue;
-    if (typeof v === 'string' && v.length > 0) otherIds[k] = v;
+    const clean = sanitizeQualifierValue(v);
+    if (clean) otherIds[k] = clean;
   }
   if (Object.keys(otherIds).length > 0) quals.identifiers = otherIds;
 
   const cm = canonical?.canonical_match ?? null;
   const canonicalId = cm?.canonical_id ?? identifiers.canonical_id ?? undefined;
-  const displayName = canonical?.name?.trim()
-    || quals.legal_name
-    || cm?.canonical_name
-    || qualified?.original_text
-    || fallback.text
-    || '';
+  const displayName = stripPageTags(
+    canonical?.name?.trim()
+      || quals.legal_name
+      || cm?.canonical_name
+      || qualified?.original_text
+      || fallback.text
+      || '',
+  );
 
+  const text = fallback.text || qualified?.original_text || undefined;
   const out: Entity = {
     name: displayName,
     type: parseEntityType(fallback.type ?? qualified?.entity_type ?? null),
-    text: fallback.text || qualified?.original_text || undefined,
-    fqn: canonical?.fqn || undefined,
+    text: text ? (stripPageTags(text) || undefined) : undefined,
+    fqn: canonical?.fqn ? (stripPageTags(canonical.fqn) || undefined) : undefined,
     canonicalId: canonicalId || undefined,
     qualifiers: Object.keys(quals).length > 0 ? quals : undefined,
   };

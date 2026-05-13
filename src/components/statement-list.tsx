@@ -4,7 +4,6 @@ import { useState } from 'react';
 import {
   Statement,
   Entity,
-  EntityQualifiers,
   ExtractionMethod,
   getEntityBadgeClass,
 } from '@/lib/types';
@@ -89,58 +88,59 @@ function CanonicalIdChip({ canonicalId }: { canonicalId: string }) {
   );
 }
 
-function QualifierChips({ qualifiers }: { qualifiers: EntityQualifiers }) {
-  const chips: Array<{ k: string; v: string }> = [];
-  if (qualifiers.role) chips.push({ k: 'role', v: qualifiers.role });
-  if (qualifiers.org) chips.push({ k: 'org', v: qualifiers.org });
-  if (qualifiers.legal_name) chips.push({ k: 'legal', v: qualifiers.legal_name });
-  if (qualifiers.region) chips.push({ k: 'region', v: qualifiers.region });
-  if (qualifiers.city) chips.push({ k: 'city', v: qualifiers.city });
-  if (qualifiers.source) chips.push({ k: 'src', v: qualifiers.source });
-  if (qualifiers.identifiers) {
-    for (const [k, v] of Object.entries(qualifiers.identifiers)) {
-      chips.push({ k, v });
+/**
+ * Compact one-row context summary for a qualified entity. Renders inline
+ * facts (role · org · region · legal name · source) followed by the
+ * canonical-ID link and match-method/confidence chip. Returns null when
+ * there's nothing to say — the caller is responsible for hiding the
+ * surrounding label too.
+ */
+function EntityContextLine({ entity }: { entity: Entity }) {
+  const q = entity.qualifiers;
+  const facts: string[] = [];
+  if (q?.role) facts.push(q.role);
+  if (q?.org) facts.push(q.org);
+  if (q?.legal_name && q.legal_name !== entity.name) facts.push(q.legal_name);
+  const place = q?.city ?? q?.region ?? q?.country ?? q?.jurisdiction;
+  if (place) facts.push(place);
+  // Extra unscoped identifiers (LEI, ticker, etc.) — show as `key=value`.
+  if (q?.identifiers) {
+    for (const [k, v] of Object.entries(q.identifiers)) {
+      facts.push(`${k}=${v}`);
     }
   }
-  if (chips.length === 0) return null;
-  return (
-    <div className="flex flex-wrap gap-1 mt-1">
-      {chips.map((c, i) => (
-        <span
-          key={i}
-          className="text-[10px] px-1.5 py-0.5 rounded bg-gray-100 text-gray-600"
-          title={c.k}
-        >
-          <span className="opacity-60">{c.k}:</span> {c.v}
-        </span>
-      ))}
-    </div>
-  );
-}
 
-function EntityDetail({ entity }: { entity: Entity }) {
-  const hasDetail = entity.fqn || entity.canonicalId || entity.qualifiers || (entity.text && entity.text !== entity.name);
-  if (!hasDetail) return null;
+  const hasMatchInfo = typeof entity.matchConfidence === 'number' && entity.matchMethod;
+  const hasOriginalText = entity.text && entity.text !== entity.name;
+  const hasAnything = facts.length > 0 || entity.canonicalId || hasMatchInfo || hasOriginalText;
+  if (!hasAnything) return null;
+
   return (
-    <div className="mt-1 ml-1 text-xs text-gray-600">
-      {entity.fqn && entity.fqn !== entity.name && (
-        <div className="font-medium text-gray-700">{entity.fqn}</div>
+    <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-gray-600 leading-snug">
+      {facts.length > 0 && (
+        <span>
+          {facts.map((f, i) => (
+            <span key={i}>
+              {i > 0 && <span className="mx-1.5 text-gray-300">·</span>}
+              {f}
+            </span>
+          ))}
+        </span>
       )}
-      {entity.text && entity.text !== entity.name && (
-        <div className="text-gray-400 italic">&ldquo;{entity.text}&rdquo;</div>
+      {entity.canonicalId && <CanonicalIdChip canonicalId={entity.canonicalId} />}
+      {hasMatchInfo && (
+        <span
+          className="text-[10px] px-1.5 py-0.5 rounded bg-violet-50 text-violet-700 border border-violet-200"
+          title="How the entity was matched against the canonical database"
+        >
+          {entity.matchMethod} · {Math.round((entity.matchConfidence ?? 0) * 100)}%
+        </span>
       )}
-      <div className="flex flex-wrap items-center gap-1 mt-1">
-        {entity.canonicalId && <CanonicalIdChip canonicalId={entity.canonicalId} />}
-        {typeof entity.matchConfidence === 'number' && entity.matchMethod && (
-          <span
-            className="text-[10px] px-1.5 py-0.5 rounded bg-violet-50 text-violet-700 border border-violet-200"
-            title={`Match method: ${entity.matchMethod}`}
-          >
-            {entity.matchMethod} · {Math.round(entity.matchConfidence * 100)}%
-          </span>
-        )}
-      </div>
-      {entity.qualifiers && <QualifierChips qualifiers={entity.qualifiers} />}
+      {hasOriginalText && (
+        <span className="text-gray-400 italic" title="Original span in the source text">
+          &ldquo;{entity.text}&rdquo;
+        </span>
+      )}
     </div>
   );
 }
@@ -262,6 +262,17 @@ function TaxonomyBadge({
   );
 }
 
+/** Helper: does an entity carry any context worth showing under the triple? */
+function hasEntityContext(e: Entity): boolean {
+  return Boolean(
+    e.canonicalId
+      || e.qualifiers
+      || e.matchMethod
+      || (e.text && e.text !== e.name)
+      || (e.fqn && e.fqn !== e.name),
+  );
+}
+
 function StatementCard({ statement, index }: { statement: Statement; index: number }) {
   const [showAll, setShowAll] = useState(false);
 
@@ -273,121 +284,120 @@ function StatementCard({ statement, index }: { statement: Statement; index: numb
   const hiddenTaxonomyCount = Math.max(0, taxonomy.length - visibleTaxonomy.length);
   const canExpand = taxonomy.length > 3;
 
+  const subjectHasContext = hasEntityContext(statement.subject);
+  const objectHasContext = Boolean(statement.object.name) && hasEntityContext(statement.object);
+  const showContextSection = subjectHasContext || objectHasContext;
+
   return (
-    <div className="editorial-card p-4">
-      {/* Header row */}
-      <div className="flex items-start justify-between gap-3 mb-3">
+    <div className="editorial-card p-4 space-y-3">
+      {/* Triple line — the focal point. Index, type-tinted SVO badges,
+          predicate-category chip, and a quiet meta cluster on the right. */}
+      <div className="flex items-start justify-between gap-3">
         <div className="flex items-start gap-3 flex-1 min-w-0">
           <span className="text-xs font-bold text-gray-400 mt-1">#{index + 1}</span>
-          <div className="flex-1 min-w-0">
-            <div className="flex flex-wrap items-center gap-2">
-              <EntityBadge name={statement.subject.name} type={statement.subject.type} />
-              <ArrowRight className="w-4 h-4 text-gray-400 flex-shrink-0" />
-              <span className="font-semibold text-gray-700">
-                {statement.canonicalPredicate || statement.predicate}
-                {statement.canonicalPredicate
-                  && statement.canonicalPredicate !== statement.predicate && (
-                    <span
-                      className="text-gray-400 font-normal ml-1"
-                      title={`Original: "${statement.predicate}"`}
-                    >
-                      *
-                    </span>
-                  )}
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5 flex-1 min-w-0">
+            <EntityBadge name={statement.subject.name} type={statement.subject.type} />
+            <ArrowRight className="w-4 h-4 text-gray-400 flex-shrink-0" />
+            <span className="font-semibold text-gray-700">
+              {statement.canonicalPredicate || statement.predicate}
+              {statement.canonicalPredicate
+                && statement.canonicalPredicate !== statement.predicate && (
+                  <span
+                    className="text-gray-400 font-normal ml-1"
+                    title={`Original: "${statement.predicate}"`}
+                  >
+                    *
+                  </span>
+                )}
+            </span>
+            {statement.predicateCategory && (
+              <span
+                className="text-[10px] px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700 border border-indigo-200"
+                title="Predicate category"
+              >
+                {statement.predicateCategory}
               </span>
-              {statement.object.name && (
-                <>
-                  <ArrowRight className="w-4 h-4 text-gray-400 flex-shrink-0" />
-                  <EntityBadge name={statement.object.name} type={statement.object.type} />
-                </>
-              )}
-              {statement.predicateCategory && (
-                <span className="text-[10px] px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700 border border-indigo-200">
-                  {statement.predicateCategory}
-                </span>
-              )}
-            </div>
+            )}
+            {statement.object.name && (
+              <>
+                <ArrowRight className="w-4 h-4 text-gray-400 flex-shrink-0" />
+                <EntityBadge name={statement.object.name} type={statement.object.type} />
+              </>
+            )}
           </div>
         </div>
-        <div className="flex items-center gap-2 text-xs">
-          <div className="flex items-center gap-1">
-            <span className="text-gray-400">Source:</span>
-            <ExtractionMethodBadge method={statement.extractionMethod} />
-          </div>
-          <div className="flex items-center gap-1">
-            <span className="text-gray-400">Conf:</span>
-            <ConfidenceBadge confidence={statement.confidence} />
-          </div>
+        <div className="flex flex-col items-end gap-1 text-xs flex-shrink-0">
+          <ConfidenceBadge confidence={statement.confidence} />
+          {statement.extractionMethod && <ExtractionMethodBadge method={statement.extractionMethod} />}
         </div>
       </div>
 
-      {/* Entity details (FQN, canonical id, qualifiers) — side by side */}
-      {(statement.subject.canonicalId
-        || statement.subject.fqn
-        || statement.subject.qualifiers
-        || statement.object.canonicalId
-        || statement.object.fqn
-        || statement.object.qualifiers) && (
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-3 pl-6 mb-2">
-          <div>
-            <div className="text-[10px] uppercase tracking-wide text-gray-400 mb-0.5">Subject</div>
-            <EntityDetail entity={statement.subject} />
-          </div>
-          {statement.object.name && (
+      {/* Entity context — one tight row per entity that has anything to add.
+          Skips silently when neither side is qualified. */}
+      {showContextSection && (
+        <div className="pl-6 space-y-1.5 border-l-2 border-gray-100 ml-1.5">
+          {subjectHasContext && (
             <div>
-              <div className="text-[10px] uppercase tracking-wide text-gray-400 mb-0.5">Object</div>
-              <EntityDetail entity={statement.object} />
+              <span className="text-[10px] uppercase tracking-wide text-gray-400 mr-2">Subject</span>
+              <EntityContextLine entity={statement.subject} />
+            </div>
+          )}
+          {objectHasContext && (
+            <div>
+              <span className="text-[10px] uppercase tracking-wide text-gray-400 mr-2">Object</span>
+              <EntityContextLine entity={statement.object} />
             </div>
           )}
         </div>
       )}
 
-      {/* Labels row */}
-      {labelsToShow.length > 0 && (
-        <div className="flex flex-wrap items-center gap-2 pl-6 mb-2">
-          <span className="text-[10px] uppercase tracking-wide text-gray-400">Labels:</span>
-          {labelsToShow.map((label, i) => (
-            <LabelBadge
-              key={i}
-              label={label.label_type}
-              value={label.label_value}
-              confidence={label.confidence}
-            />
-          ))}
-        </div>
-      )}
-
-      {/* Taxonomy row */}
-      {taxonomy.length > 0 && (
-        <div className="flex flex-wrap items-center gap-2 pl-6 mb-2">
-          <span className="text-[10px] uppercase tracking-wide text-gray-400">Topics:</span>
-          {visibleTaxonomy.map((t, i) => (
-            <TaxonomyBadge key={i} category={t.category} label={t.label} confidence={t.confidence} />
-          ))}
-          {canExpand && (
-            <button
-              onClick={() => setShowAll(s => !s)}
-              className="inline-flex items-center gap-0.5 text-xs text-gray-500 hover:text-gray-700"
-            >
-              {showAll ? (
-                <>
-                  <ChevronDown className="w-3 h-3" />
-                  show less
-                </>
-              ) : (
-                <>
-                  <ChevronRight className="w-3 h-3" />
-                  +{hiddenTaxonomyCount} more
-                </>
+      {/* Labels + topics merged onto one wrapping row when both are small.
+          Keep them separate visually only when topics need an expander. */}
+      {(labelsToShow.length > 0 || taxonomy.length > 0) && (
+        <div className="pl-6 space-y-1.5">
+          {labelsToShow.length > 0 && (
+            <div className="flex flex-wrap items-center gap-2">
+              {labelsToShow.map((label, i) => (
+                <LabelBadge
+                  key={i}
+                  label={label.label_type}
+                  value={label.label_value}
+                  confidence={label.confidence}
+                />
+              ))}
+            </div>
+          )}
+          {taxonomy.length > 0 && (
+            <div className="flex flex-wrap items-center gap-2">
+              {visibleTaxonomy.map((t, i) => (
+                <TaxonomyBadge key={i} category={t.category} label={t.label} confidence={t.confidence} />
+              ))}
+              {canExpand && (
+                <button
+                  onClick={() => setShowAll(s => !s)}
+                  className="inline-flex items-center gap-0.5 text-xs text-gray-500 hover:text-gray-700"
+                >
+                  {showAll ? (
+                    <>
+                      <ChevronDown className="w-3 h-3" />
+                      show less
+                    </>
+                  ) : (
+                    <>
+                      <ChevronRight className="w-3 h-3" />
+                      +{hiddenTaxonomyCount} more
+                    </>
+                  )}
+                </button>
               )}
-            </button>
+            </div>
           )}
         </div>
       )}
 
       {/* Source text */}
       {statement.text && (
-        <div className="flex items-start gap-2 mt-3 pl-6">
+        <div className="flex items-start gap-2 pl-6">
           <Quote className="w-4 h-4 text-gray-300 flex-shrink-0 mt-0.5" />
           <p className="text-sm text-gray-600 italic leading-relaxed">{statement.text}</p>
         </div>
