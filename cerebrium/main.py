@@ -39,15 +39,24 @@ from typing import Optional
 print("=" * 60)
 print("[init] probing /persistent-storage for project volume")
 _VOLUME: Optional[Path] = None
+# Always select a mounted volume regardless of free space. The previous
+# 40 GB floor was meant as a safety check, but it silently disabled the
+# cache redirect once the project volume filled up — causing every cold
+# start to re-download ~94 GB of entity DB + USearch indexes into the
+# container's ephemeral disk (~3 min wasted per run). A genuine
+# out-of-space write would now surface as a hard error with a stack
+# trace, which is strictly more useful than silent fallback.
 for _p in ("/persistent-storage", "/workspace"):
     _P = Path(_p)
     if _P.is_dir():
         _free_gb = shutil.disk_usage(_p).free / 1024 ** 3
         _is_mount = os.path.ismount(_p)
         print(f"[init]   {_p}: exists is_mount={_is_mount} free={_free_gb:.1f} GB")
-        if _free_gb >= 40 and _VOLUME is None:
+        if _is_mount and _VOLUME is None:
             _VOLUME = _P
             print(f"[init] selected volume: {_p}")
+            if _free_gb < 20:
+                print(f"[init] WARNING: only {_free_gb:.1f} GB free — consider resizing the project volume")
     else:
         print(f"[init]   {_p}: missing")
 
