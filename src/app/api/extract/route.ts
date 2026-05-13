@@ -4,7 +4,22 @@ import { parseStatements } from '@/lib/statement-parser';
 import { CACHED_EXAMPLE } from '@/lib/cached-example';
 import { ExtractionResult } from '@/lib/types';
 import { getCachedStatements } from '@/lib/cache';
-import { createRun } from '@/lib/runs';
+import { createRun, webhookToken } from '@/lib/runs';
+
+const PUBLIC_BASE_URL =
+  process.env.NEXT_PUBLIC_SITE_URL
+  ?? (process.env.VERCEL_PROJECT_PRODUCTION_URL
+    ? `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}`
+    : process.env.VERCEL_URL
+      ? `https://${process.env.VERCEL_URL}`
+      : 'http://localhost:3000');
+
+/** Construct the Cerebrium webhookEndpoint URL with the per-run HMAC token. */
+function webhookEndpointFor(runId: string): string {
+  const url = new URL(`/api/extract/webhook/${runId}`, PUBLIC_BASE_URL);
+  url.searchParams.set('token', webhookToken(runId));
+  return url.toString();
+}
 
 // Submission only — the handler now fires-and-forgets to Cerebrium and
 // returns a run_id within a couple of seconds. Long-running pipeline work
@@ -25,14 +40,23 @@ class CerebriumSubmitError extends Error {
   }
 }
 
-/** Fire-and-forget POST to a Cerebrium function with ?async=true. Returns
- *  Cerebrium's own run_id (we ignore it; the source of truth for results
- *  is our own run_id which the function uses to write back to Supabase). */
-async function submitAsync(endpointUrl: string, body: object): Promise<{ cerebriumRunId: string }> {
+/** Fire-and-forget POST to a Cerebrium function with ?async=true and a
+ *  webhookEndpoint that points back at our /api/extract/webhook/[runId]
+ *  route. Cerebrium POSTs the function's return value to that URL when the
+ *  run completes; the webhook then writes the result into Supabase. */
+async function submitAsync(
+  endpointUrl: string,
+  body: object,
+  runId: string,
+): Promise<{ cerebriumRunId: string }> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), SUBMIT_TIMEOUT_MS);
+  const params = new URLSearchParams({
+    async: 'true',
+    webhookEndpoint: webhookEndpointFor(runId),
+  });
   const sep = endpointUrl.includes('?') ? '&' : '?';
-  const url = `${endpointUrl}${sep}async=true`;
+  const url = `${endpointUrl}${sep}${params.toString()}`;
   try {
     const response = await fetch(url, {
       method: 'POST',
@@ -107,12 +131,15 @@ export async function POST(request: NextRequest) {
       }
 
       try {
-        const { cerebriumRunId } = await submitAsync(CEREBRIUM_EXTRACT_URL, {
-          text: modelInput,
-          useCanonicalPredicates: !!useCanonicalPredicates,
-          similarityThreshold: 0.5,
-          run_id: runId,
-        });
+        const { cerebriumRunId } = await submitAsync(
+          CEREBRIUM_EXTRACT_URL,
+          {
+            text: modelInput,
+            useCanonicalPredicates: !!useCanonicalPredicates,
+            similarityThreshold: 0.5,
+          },
+          runId,
+        );
         console.log(`Submitted extract run=${runId} cerebrium=${cerebriumRunId}`);
         return NextResponse.json({ run_id: runId, status: 'pending' }, { status: 202 });
       } catch (err) {
@@ -201,13 +228,16 @@ async function handleUrlSubmission(
   }
 
   try {
-    const { cerebriumRunId } = await submitAsync(CEREBRIUM_EXTRACT_URL_URL, {
-      url,
-      useOcr: options.useOcr || false,
-      maxTokens: options.maxTokens || 1000,
-      overlapTokens: options.overlapTokens || 100,
-      run_id: runId,
-    });
+    const { cerebriumRunId } = await submitAsync(
+      CEREBRIUM_EXTRACT_URL_URL,
+      {
+        url,
+        useOcr: options.useOcr || false,
+        maxTokens: options.maxTokens || 1000,
+        overlapTokens: options.overlapTokens || 100,
+      },
+      runId,
+    );
     console.log(`Submitted extract_url run=${runId} cerebrium=${cerebriumRunId} url=${url}`);
     return NextResponse.json({ run_id: runId, status: 'pending' }, { status: 202 });
   } catch (err) {

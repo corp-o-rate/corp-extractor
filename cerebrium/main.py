@@ -27,7 +27,6 @@ import shutil
 import threading
 import time
 import traceback
-import urllib.request
 from collections import OrderedDict
 from pathlib import Path
 from typing import Optional
@@ -154,44 +153,6 @@ def _cache_key(*parts: object) -> str:
     return hashlib.sha256("|".join(str(p) for p in parts).encode()).hexdigest()
 
 
-# ---------------------------------------------------------------------------
-# Supabase result writer. Used by the async path: Vercel inserts a 'pending'
-# row keyed by run_id, then submits this function with that run_id in the
-# body; this writer updates the row with the result (or error) when work
-# completes. The browser polls /api/extract/status/<run_id> to read it back.
-# ---------------------------------------------------------------------------
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
-SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
-
-
-def _supabase_update_run(run_id: str, fields: dict) -> None:
-    """PATCH a row in extraction_runs. Best-effort: a Supabase failure
-    must NOT crash the Cerebrium function — we still want logs / dashboard
-    success rather than retries that double-charge compute."""
-    if not (SUPABASE_URL and SUPABASE_SERVICE_KEY):
-        logger.warning(f"Supabase not configured; skipping run update for {run_id}")
-        return
-    url = f"{SUPABASE_URL}/rest/v1/extraction_runs?run_id=eq.{run_id}"
-    body = json.dumps(fields).encode()
-    req = urllib.request.Request(
-        url,
-        data=body,
-        method="PATCH",
-        headers={
-            "apikey": SUPABASE_SERVICE_KEY,
-            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-            "Content-Type": "application/json",
-            "Prefer": "return=minimal",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            if resp.status >= 300:
-                logger.warning(f"Supabase PATCH {run_id} returned {resp.status}: {resp.read()[:300]!r}")
-    except Exception as e:
-        logger.warning(f"Supabase PATCH {run_id} failed: {e}")
-
-
 def _evict_if_needed(new_entry_size: int) -> None:
     global _cache_size_bytes
     while _result_cache and (_cache_size_bytes + new_entry_size) > MAX_CACHE_SIZE_BYTES:
@@ -301,45 +262,29 @@ def _process_url_sync(url: str, use_ocr: bool, max_tokens: int, overlap_tokens: 
 # ---------------------------------------------------------------------------
 
 
-def _finalise_run(run_id: Optional[str], result: Optional[dict], error: Optional[str]) -> None:
-    """Persist terminal state to Supabase. No-op when run_id is missing
-    (i.e. legacy sync path with no run tracking)."""
-    if not run_id:
-        return
-    fields: dict = {"completed_at": "now()"}
-    if error is not None:
-        fields["status"] = "failed"
-        fields["error"] = error[:8000]
-    else:
-        fields["status"] = "succeeded"
-        fields["result"] = result
-    _supabase_update_run(run_id, fields)
-
-
 def extract(
     text: str = "",
     useCanonicalPredicates: bool = False,
     similarityThreshold: float = 0.5,
-    run_id: str = "",
 ) -> dict:
     """Text extraction endpoint.
+
+    For async submissions Cerebrium POSTs this function's return value to
+    the URL given as `?webhookEndpoint=...` on submit; that URL carries the
+    run_id (set by Vercel) so the handler itself stays stateless and
+    credential-free.
 
     POST body kwargs:
       text: str                          — required; will be wrapped in <page>
                                             tags by the frontend before sending
       useCanonicalPredicates: bool=False — match against CANONICAL_PREDICATES
       similarityThreshold: float=0.5     — predicate match threshold (0-1)
-      run_id: str=""                     — if set, write the result to
-                                            extraction_runs[run_id] in Supabase
-                                            (async path; see /api/extract).
     """
     _initialize()
 
     text = (text or "").strip()
     if not text:
-        err = {"error": "No text provided. Send {\"text\": \"...\"}"}
-        _finalise_run(run_id or None, None, err["error"])
-        return err
+        return {"error": "No text provided. Send {\"text\": \"...\"}"}
 
     use_canonical = bool(useCanonicalPredicates)
     threshold = max(0.0, min(1.0, float(similarityThreshold)))
@@ -349,13 +294,9 @@ def extract(
         _result_cache.move_to_end(cache_key)
         cached = json.loads(_result_cache[cache_key])
         cached["cached"] = True
-        _finalise_run(run_id or None, cached, None)
         return cached
 
-    if run_id:
-        _supabase_update_run(run_id, {"status": "running"})
-
-    logger.info(f"extract: len={len(text)} canonical={use_canonical} thresh={threshold} run_id={run_id or '-'}")
+    logger.info(f"extract: len={len(text)} canonical={use_canonical} thresh={threshold}")
     t0 = time.time()
     try:
         with _inference_lock:
@@ -363,15 +304,15 @@ def extract(
     except Exception as e:
         elapsed = time.time() - t0
         logger.exception(f"extract failed after {elapsed:.2f}s")
-        msg = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
-        _finalise_run(run_id or None, None, msg)
-        return {"error": str(e)}
+        return {
+            "error": f"{type(e).__name__}: {e}",
+            "traceback": traceback.format_exc(),
+        }
     elapsed = time.time() - t0
     logger.info(f"extract complete in {elapsed:.2f}s")
 
     payload = json.dumps(result)
     _cache_put(cache_key, payload)
-    _finalise_run(run_id or None, result, None)
     return result
 
 
@@ -380,7 +321,6 @@ def extract_url(
     useOcr: bool = False,
     maxTokens: int = 1000,
     overlapTokens: int = 100,
-    run_id: str = "",
 ) -> dict:
     """URL processing endpoint.
 
@@ -389,16 +329,12 @@ def extract_url(
       useOcr: bool=False     — run OCR on PDFs (else PyMuPDF text extraction)
       maxTokens: int=1000    — chunking target tokens per chunk
       overlapTokens: int=100 — chunk overlap
-      run_id: str=""         — if set, write the result to
-                                extraction_runs[run_id] in Supabase.
     """
     _initialize()
 
     url = (url or "").strip()
     if not url:
-        err = {"error": "No url provided. Send {\"url\": \"...\"}"}
-        _finalise_run(run_id or None, None, err["error"])
-        return err
+        return {"error": "No url provided. Send {\"url\": \"...\"}"}
 
     use_ocr = bool(useOcr)
     max_tokens = int(maxTokens)
@@ -409,13 +345,9 @@ def extract_url(
         _result_cache.move_to_end(cache_key)
         cached = json.loads(_result_cache[cache_key])
         cached["cached"] = True
-        _finalise_run(run_id or None, cached, None)
         return cached
 
-    if run_id:
-        _supabase_update_run(run_id, {"status": "running"})
-
-    logger.info(f"extract_url: url={url} ocr={use_ocr} max_tokens={max_tokens} run_id={run_id or '-'}")
+    logger.info(f"extract_url: url={url} ocr={use_ocr} max_tokens={max_tokens}")
     t0 = time.time()
     try:
         with _inference_lock:
@@ -423,13 +355,13 @@ def extract_url(
     except Exception as e:
         elapsed = time.time() - t0
         logger.exception(f"extract_url failed after {elapsed:.2f}s")
-        msg = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
-        _finalise_run(run_id or None, None, msg)
-        return {"error": str(e)}
+        return {
+            "error": f"{type(e).__name__}: {e}",
+            "traceback": traceback.format_exc(),
+        }
     elapsed = time.time() - t0
     logger.info(f"extract_url complete in {elapsed:.2f}s, statements={len(result.get('statements', []))}")
 
     payload = json.dumps(result)
     _cache_put(cache_key, payload)
-    _finalise_run(run_id or None, result, None)
     return result
