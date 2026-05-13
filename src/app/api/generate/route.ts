@@ -36,11 +36,13 @@ export async function POST() {
 Requirements:
 - Write exactly 2 paragraphs
 - Maximum 1000 words total
-- Include specific names of people, organizations, and places
-- Include dates, numbers, and statistics where appropriate
-- Write in a professional journalistic style
-- Make it factual-sounding (but fictional) with clear subject-predicate-object relationships
-- Do not include a headline or title, just the body text`,
+- Use ONLY real, verifiable people, organizations, and places — no fictional or invented names.
+- Every person named must be a real public figure, and the role attributed to them (CEO, founder, minister, professor, etc.) must be their actual, current (or last-known) role at the named organization. Do not invent roles or assign people to organizations they don't actually belong to.
+- Every company, agency, university, or other organization named must be a real entity that exists today.
+- Cities, countries, products, and other proper nouns must also be real.
+- Include dates, numbers, and statistics where appropriate; these should be plausible but do not need to be exact.
+- Write in a professional journalistic style with clear subject-predicate-object relationships.
+- Do not include a headline or title, just the body text.`,
     });
 
     return result.toTextStreamResponse();
