@@ -1,0 +1,31 @@
+name: electric_future_initiative
+description: |
+  Regression case for the EFI / ELECTRIC FUTURE LIMITED mismatch (Cerebrium run
+  3a0683bb-7a37-9e7d-9ecd-362fc8651b8e, 2026-05-13). The article describes a US
+  government policy programme; the qualifier wrongly stamped it with the
+  Companies House ID of a UK company that shares two words. This fixture pins
+  the fix in place — the programme must never resolve to a Companies House
+  entry or to "ELECTRIC FUTURE LIMITED".
+text: |
+  On October 12, 2023, the Biden Administration announced a substantial policy shift aimed at promoting electric vehicle (EV) adoption among American consumers and businesses. The new initiative, dubbed the "Electric Future Initiative," will allocate $7 billion towards expanding the EV charging infrastructure across the United States, a move designed to facilitate the transition to greener transportation. U.S. Secretary of Energy Jennifer Granholm emphasized the importance of this transition during the announcement, stating, "Transforming our nation’s transportation infrastructure is crucial not just for reducing greenhouse gas emissions but also for creating jobs and boosting the economy." The policy aims to install over 500,000 new charging stations by 2026, targeting both urban areas and rural communities to ensure equitable access to EV technology.
+  Business leaders have expressed cautious optimism about the initiative. General Motors CEO Mary Barra hailed the funding as a necessary step for the industry, stating that increased charging availability is essential for encouraging consumers to switch to electric vehicles. Meanwhile, advocacy groups like the Electric Vehicle Association applaud the initiative but stress the importance of a robust grid to support increased electricity demand. “Expanding charging infrastructure is vital, but it must be complemented by efforts to bolster renewable energy production and grid resilience,” remarked EV Association President, Nisha K. Menon. As the U.S. grapples with rising fuel prices and climate change challenges, the Electric Future Initiative marks a pivotal moment in reshaping national energy strategies and enhancing the electric vehicle market.
+expect:
+  min_statements: 5
+  entities:
+    # ---- Negative rules — the original bug ----
+    - text: "Electric Future Initiative"
+      canonical_id_must_not_match: "^UK-CH:"
+      canonical_name_must_not_match: "(?i)electric future limited"
+      reason: "Government policy programme is not a UK Companies House company"
+
+    # ---- Positive rules — known-good resolutions in this article ----
+    - text: "Mary Barra"
+      must_resolve: true
+      canonical_id_matches: "^wikidata:Q"
+
+    - text: "Jennifer Granholm"
+      must_resolve: true
+      canonical_id_matches: "^wikidata:Q"
+
+    - text: "General Motors"
+      must_resolve: true

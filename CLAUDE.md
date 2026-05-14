@@ -30,6 +30,12 @@ Statement Extractor is a web demo for the T5-Gemma 2 statement extraction model.
 
 ## Commands
 
+### Git hooks (one-time per clone)
+```bash
+git config core.hooksPath .githooks
+```
+After this, every `git push` runs the corp-extractor regression fixture suite locally (`statement-extractor-lib/tests/test_regression_fixtures.py -m slow`). Push is aborted on any failure. Bypass intentionally with `git push --no-verify`. See `.githooks/README.md` for details and first-run download expectations.
+
 ### Frontend (Next.js)
 ```bash
 pnpm install     # Install dependencies

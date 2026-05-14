@@ -31,8 +31,12 @@ from ...llm import LLM
 logger = logging.getLogger(__name__)
 
 
-# LLM prompt template for person matching confirmation
-PERSON_MATCH_PROMPT = """You are matching a person name extracted from text to a database of notable people.
+# LLM prompt template for person matching confirmation.
+#
+# The LLM is the final arbiter: it must VERIFY that a candidate refers to the
+# same individual person. Reject when the extracted name isn't a person at all
+# (an organisation, a role/title, a location, a group description).
+PERSON_MATCH_PROMPT = """You are verifying whether any candidate refers to the SAME individual person as a name extracted from text.
 
 Extracted name: "{query_name}"
 Context from text: {context_info}
@@ -41,14 +45,15 @@ Source text: "{source_preview}"
 Candidates from database (with Wikipedia info):
 {candidates}
 
-Task: Select the BEST match, or respond "NONE" if no candidate is a good match.
+Task: Select the candidate that refers to the SAME individual person as "{query_name}", or respond "NONE" if no candidate is a verified match.
 
-IMPORTANT RULES:
-1. The candidate name must closely match the extracted name "{query_name}"
-2. Similar-sounding names are NOT matches (e.g., "Andy Vassies" does NOT match "Andy Jassy")
-3. If no candidate has a name that matches "{query_name}", respond "NONE"
-4. Consider role and organization context only AFTER confirming name match
-5. When in doubt, prefer "NONE" over a wrong match
+IMPORTANT RULES (apply in order):
+1. Reject (respond "NONE") if "{query_name}" does NOT refer to an individual person. Organisations, role/title strings ("CEO", "President"), locations, and generic group descriptions ("Community leaders", "Business owners", "Investors", "Customers", "Officials") are NOT matches for a specific person.
+2. The candidate name must closely match the extracted name "{query_name}".
+3. Similar-sounding names are NOT matches (e.g., "Andy Vassies" does NOT match "Andy Jassy").
+4. If no candidate has a name that matches "{query_name}", respond "NONE".
+5. Consider role and organization context only AFTER confirming the name refers to the same individual.
+6. When in doubt, prefer "NONE" over a wrong match.
 
 Respond with ONLY the number of the best match (1, 2, 3, etc.) or "NONE".
 """
@@ -543,24 +548,22 @@ class PersonQualifierPlugin(BaseQualifierPlugin):
         """
         Select the best match from candidates.
 
-        Uses LLM if available, otherwise returns top match if confidence is high enough.
+        When the LLM is available it is the sole arbiter: an exception or
+        unparseable response yields ``None``. The top-boosted-score fallback
+        is only used when no LLM is configured (test/dev path).
         """
         if not candidates:
             return None
 
-        # If only one strong match, use it directly
-        if len(candidates) == 1 and candidates[0][2] >= 0.9:
-            logger.info(f"    Single strong match: '{candidates[0][0].name}' (boosted={candidates[0][2]:.3f})")
-            return candidates[0]
-
-        # Try LLM confirmation
+        # LLM is the arbiter when configured.
         if self._llm is not None:
             try:
                 return self._llm_select_match(query_name, candidates, extracted_role, extracted_org, context)
             except Exception as e:
-                logger.warning(f"    LLM confirmation failed: {e}")
+                logger.warning(f"    LLM confirmation failed: {e}; rejecting match (fail closed)")
+                return None
 
-        # Fallback: use top match if boosted score is high enough
+        # No-LLM path: use top match if boosted score is high enough.
         top_record, top_similarity, top_boosted = candidates[0]
         if top_boosted >= 0.85:
             logger.info(f"    No LLM, using top match: '{top_record.name}' (boosted={top_boosted:.3f})")
@@ -629,19 +632,16 @@ class PersonQualifierPlugin(BaseQualifierPlugin):
 
         try:
             idx = int(response) - 1
-            if 0 <= idx < len(candidates):
-                chosen = candidates[idx]
-                logger.info(f"    LLM chose: #{idx + 1} '{chosen[0].name}' (boosted={chosen[2]:.3f})")
-                return chosen
         except ValueError:
-            logger.warning(f"    LLM response '{response}' could not be parsed as number")
+            logger.warning(f"    LLM response '{response}' could not be parsed as number; rejecting match")
+            return None
 
-        # Fallback to top match if LLM response is unclear and score is decent
-        if candidates[0][2] >= 0.8:
-            logger.info(f"    Fallback to top match: '{candidates[0][0].name}' (boosted={candidates[0][2]:.3f})")
-            return candidates[0]
+        if 0 <= idx < len(candidates):
+            chosen = candidates[idx]
+            logger.info(f"    LLM chose: #{idx + 1} '{chosen[0].name}' (boosted={chosen[2]:.3f})")
+            return chosen
 
-        logger.info(f"    No confident match (top boosted={candidates[0][2]:.3f} < 0.8)")
+        logger.warning(f"    LLM picked index {idx + 1} outside range [1, {len(candidates)}]; rejecting match")
         return None
 
     def _extract_with_llm(

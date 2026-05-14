@@ -25,25 +25,57 @@ from ...models import (
 logger = logging.getLogger(__name__)
 
 
-# LLM prompt template for company matching confirmation
-COMPANY_MATCH_PROMPT = """You are matching a company name extracted from text to a database of known companies.
+# LLM prompt template for company matching confirmation.
+#
+# The LLM is the final arbiter: it must VERIFY that a candidate refers to the
+# same real-world company, not merely pick the closest-looking string. Embedding
+# similarity gets us candidates; the LLM rejects them when the extracted name
+# isn't actually a company at all (a policy/programme/act/event/etc.) or when
+# the candidate is a different legal entity that just happens to share words.
+COMPANY_MATCH_PROMPT = """You are verifying whether any candidate refers to the SAME real-world company as a name extracted from text.
 
 Extracted name: "{query_name}"
+Extracted type: {extracted_type}
 {context_line}
 Candidate matches (sorted by similarity):
 {candidates}
 
-Task: Select the BEST match, or respond "NONE" if no candidate is a good match.
+Task: Select the candidate that refers to the SAME real-world company as "{query_name}", or respond "NONE" if no candidate is a verified match.
 
-Rules:
-- The match should refer to the same legal entity
-- Minor spelling differences or abbreviations are OK (e.g., "Apple" matches "Apple Inc.")
-- Different companies with similar names should NOT match
-- Consider the REGION when matching - prefer companies from regions mentioned in or relevant to the context
-- If the extracted name is too generic or ambiguous, respond "NONE"
+Rules (apply in order):
+1. Reject (respond "NONE") if "{query_name}" does NOT refer to a company at all. Government policies, programmes, initiatives, acts, bills, strategies, plans, events, products, treaties, and agencies are NOT companies. Trailing words like "Initiative", "Plan", "Programme"/"Program", "Act", "Bill", "Strategy", "Accord", "Treaty", "Agreement", "Summit", "Coalition" are strong signals that the extracted name is NOT a company.
+2. Different organisations that share words are NOT matches. "Electric Future Initiative" is NOT "ELECTRIC FUTURE LIMITED"; "X Inc" is NOT "X Foundation"; "X Limited" is NOT "X Group plc" unless the candidate row says so.
+3. Similar-sounding or similar-spelled names are NOT matches unless they refer to the same legal entity. Minor abbreviations of the SAME company are OK (e.g., "Apple" matches "Apple Inc.").
+4. Consider the REGION and source-text context. Prefer companies from regions consistent with the context.
+5. When in doubt, prefer "NONE" over a wrong match.
 
 Respond with ONLY the number of the best match (1, 2, 3, etc.) or "NONE".
 """
+
+
+def _sentence_around_span(text: str, span: tuple[int, int], max_chars: int = 400) -> str:
+    """Slice ``text`` outward from ``span`` to nearest sentence boundary, capped at ``max_chars``."""
+    start, end = span
+    if start < 0 or end > len(text) or start >= end:
+        return text[:max_chars]
+    half = max_chars // 2
+    left_bound = max(0, start - half)
+    right_bound = min(len(text), end + half)
+    window = text[left_bound:right_bound]
+    rel_start = start - left_bound
+    boundary_chars = ".!?\n"
+    left_cut = 0
+    for i in range(rel_start - 1, -1, -1):
+        if window[i] in boundary_chars:
+            left_cut = i + 1
+            break
+    rel_end = end - left_bound
+    right_cut = len(window)
+    for i in range(rel_end, len(window)):
+        if window[i] in boundary_chars:
+            right_cut = i + 1
+            break
+    return window[left_cut:right_cut].strip()
 
 
 @PluginRegistry.qualifier
@@ -224,7 +256,7 @@ class EmbeddingCompanyQualifier(BaseQualifierPlugin):
 
         # Get best match (optionally with LLM confirmation)
         logger.info(f"    Selecting best match (LLM={self._use_llm_confirmation})...")
-        best_match = self._select_best_match(entity.text, results, context)
+        best_match = self._select_best_match(entity, results, context)
 
         if best_match is None:
             logger.info(f"    No confident match for '{entity.text}'")
@@ -242,47 +274,55 @@ class EmbeddingCompanyQualifier(BaseQualifierPlugin):
 
     def _select_best_match(
         self,
-        query_name: str,
+        entity: ExtractedEntity,
         candidates: list[tuple],
         context: "PipelineContext",
     ) -> Optional[tuple]:
         """
         Select the best match from candidates.
 
-        Uses LLM if available and configured, otherwise returns top match.
+        When LLM confirmation is enabled, the LLM is the sole arbiter: an
+        exception or unparseable response yields ``None``. No silent fallback
+        to the top embedding match.
+
+        When ``use_llm_confirmation=False`` (test/dev), falls back to the top
+        match if its similarity is high enough.
         """
         if not candidates:
             return None
 
-        # If only one strong match, use it directly
-        if len(candidates) == 1 and candidates[0][1] >= 0.9:
-            logger.info(f"    Single strong match: '{candidates[0][0].name}' (sim={candidates[0][1]:.3f})")
-            return candidates[0]
-
-        # Try LLM confirmation
-        llm = self._get_llm()
-        if llm is not None:
+        # LLM is the arbiter when confirmation is enabled.
+        if self._use_llm_confirmation:
+            llm = self._get_llm()
+            if llm is None:
+                logger.warning(
+                    f"    LLM confirmation requested but LLM unavailable for '{entity.text}'; rejecting match (fail closed)"
+                )
+                return None
             try:
-                return self._llm_select_match(query_name, candidates, context)
+                return self._llm_select_match(entity, candidates, context)
             except Exception as e:
-                logger.warning(f"    LLM confirmation failed: {e}")
+                logger.warning(f"    LLM confirmation failed: {e}; rejecting match (fail closed)")
+                return None
 
-        # Fallback: use top match if similarity is high enough
+        # No-LLM path (tests / local dev): use top match if similarity is high enough.
         top_record, top_similarity = candidates[0]
         if top_similarity >= 0.85:
             logger.info(f"    No LLM, using top match: '{top_record.name}' (sim={top_similarity:.3f})")
             return candidates[0]
 
-        logger.info(f"    No confident match for '{query_name}' (top sim={top_similarity:.3f} < 0.85)")
+        logger.info(f"    No confident match for '{entity.text}' (top sim={top_similarity:.3f} < 0.85)")
         return None
 
     def _llm_select_match(
         self,
-        query_name: str,
+        entity: ExtractedEntity,
         candidates: list[tuple],
         context: "PipelineContext",
     ) -> Optional[tuple]:
-        """Use LLM to select the best match."""
+        """Use LLM to select the best match. Returns None when the LLM rejects or its answer is unparseable."""
+        query_name = entity.text
+
         # Format candidates for prompt with region info
         candidate_lines = []
         for i, (record, similarity) in enumerate(candidates[:10], 1):  # Limit to top 10
@@ -291,15 +331,21 @@ class EmbeddingCompanyQualifier(BaseQualifierPlugin):
                 f"{i}. {record.name} (source: {record.source}{region_str}, similarity: {similarity:.3f})"
             )
 
-        # Build context line from source text if available
+        # Build context line: sentence around the entity span when available,
+        # otherwise a short document prefix.
         context_line = ""
         if context.source_text:
-            # Truncate source text for prompt
-            source_preview = context.source_text[:500] + "..." if len(context.source_text) > 500 else context.source_text
-            context_line = f"Source text context: \"{source_preview}\"\n"
+            if entity.span is not None:
+                snippet = _sentence_around_span(context.source_text, entity.span)
+                if snippet:
+                    context_line = f"Source text context: \"{snippet}\"\n"
+            if not context_line:
+                source_preview = context.source_text[:500] + "..." if len(context.source_text) > 500 else context.source_text
+                context_line = f"Source text context: \"{source_preview}\"\n"
 
         prompt = COMPANY_MATCH_PROMPT.format(
             query_name=query_name,
+            extracted_type=entity.type.value,
             context_line=context_line,
             candidates="\n".join(candidate_lines),
         )
@@ -317,19 +363,16 @@ class EmbeddingCompanyQualifier(BaseQualifierPlugin):
 
         try:
             idx = int(response) - 1
-            if 0 <= idx < len(candidates):
-                chosen = candidates[idx]
-                logger.info(f"    LLM chose: #{idx + 1} '{chosen[0].name}' (sim={chosen[1]:.3f})")
-                return chosen
         except ValueError:
-            logger.warning(f"    LLM response '{response}' could not be parsed as number")
+            logger.warning(f"    LLM response '{response}' could not be parsed as number; rejecting match")
+            return None
 
-        # Fallback to top match if LLM response is unclear
-        if candidates[0][1] >= 0.8:
-            logger.info(f"    Fallback to top match: '{candidates[0][0].name}' (sim={candidates[0][1]:.3f})")
-            return candidates[0]
+        if 0 <= idx < len(candidates):
+            chosen = candidates[idx]
+            logger.info(f"    LLM chose: #{idx + 1} '{chosen[0].name}' (sim={chosen[1]:.3f})")
+            return chosen
 
-        logger.info(f"    No confident match (top sim={candidates[0][1]:.3f} < 0.8)")
+        logger.warning(f"    LLM picked index {idx + 1} outside range [1, {len(candidates)}]; rejecting match")
         return None
 
     def _build_canonical_entity(

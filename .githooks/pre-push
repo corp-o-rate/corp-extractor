@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Pre-push hook — runs the corp-extractor regression fixture suite locally
+# before every push. Activate once per clone with:
+#   git config core.hooksPath .githooks
+# Bypass intentionally with:
+#   git push --no-verify
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+lib_dir="$repo_root/statement-extractor-lib"
+
+echo "[pre-push] Running corp-extractor regression suite ($lib_dir)..."
+
+cd "$lib_dir"
+if ! uv run pytest tests/test_regression_fixtures.py -m slow -q; then
+    echo
+    echo "[pre-push] Regression tests failed. Push aborted."
+    echo "[pre-push] Investigate and re-push. To bypass intentionally: git push --no-verify"
+    exit 1
+fi
+
+echo "[pre-push] Regression suite passed."
