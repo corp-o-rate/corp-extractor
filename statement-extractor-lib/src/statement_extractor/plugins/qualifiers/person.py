@@ -363,21 +363,29 @@ class PersonQualifierPlugin(BaseQualifierPlugin):
             else:
                 logger.debug(f"    No candidates match org '{extracted_org}'")
 
-        # Filter by minimum similarity
-        results = [(r, s) for r, s in results if s >= self._min_similarity]
-        logger.debug(f"    After min_similarity filter ({self._min_similarity}): {len(results)} results")
-
-        if not results:
-            logger.debug(f"    No person matches found above threshold {self._min_similarity}")
-            return None
-
-        # Boost scores based on name/role/org matching
+        # Boost scores based on name/role/org matching BEFORE filtering, so that
+        # exact-name matches with sub-threshold raw similarity (e.g. famous people
+        # whose embedding query mixes role/org that differ from their DB record)
+        # still reach the LLM arbiter.
         scored_results = []
         for record, similarity in results:
             boosted_score = self._compute_match_score(
                 record, similarity, extracted_role, extracted_org, query_name=person_name
             )
             scored_results.append((record, similarity, boosted_score))
+
+        # Filter on boosted score so the threshold reflects "could plausibly match"
+        # rather than raw cosine distance.
+        scored_results = [
+            entry for entry in scored_results if entry[2] >= self._min_similarity
+        ]
+        logger.debug(
+            f"    After min_similarity filter on boosted score ({self._min_similarity}): {len(scored_results)} results"
+        )
+
+        if not scored_results:
+            logger.debug(f"    No person matches found above threshold {self._min_similarity}")
+            return None
 
         # Sort by boosted score
         scored_results.sort(key=lambda x: x[2], reverse=True)

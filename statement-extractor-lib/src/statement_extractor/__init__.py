@@ -29,7 +29,7 @@ Example:
     >>> data = extract_statements_as_dict("Some text...")
 """
 
-__version__ = "0.10.1"
+__version__ = "0.10.2"
 
 # Core models
 from .models import (
